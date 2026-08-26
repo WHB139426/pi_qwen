@@ -124,7 +124,7 @@ VLLM_BASE_URL = "http://127.0.0.1:8000/v1"
 
 ENABLE_THINKING = True
 REASONING_EFFORT = "xhigh"  # "xhigh", "medium", or "low"
-SHOW_RAW_TRACE = True
+TRACE_PATH = Path("./tmp/trace.txt")
 ```
 
 The local model path and the vLLM served name have different purposes:
@@ -210,18 +210,19 @@ increasing context usage.
 
 ## Trace output
 
-Tracing belongs to the Agent rather than the vLLM adapter. It prints immediately
-after each completed model turn and avoids repeating the common context prefix
-from earlier turns.
+The Agent writes tracing to `./tmp/trace.txt` instead of the terminal. After
+each generation it overwrites the file with the complete rendered context plus
+the raw model output:
 
-`MODEL INPUT · RENDERED TEXT` is the exact context string produced by
-`QwenProtocol` and passed to `generate()`. It includes markers such as
-`<|im_start|>`, `<|im_end|>`, `<think>`, `<tool_call>`, and `<tool_response>`, as
-well as the reasoning instruction, tool schemas, `AGENTS.md`, and message
-history.
+```python
+trace_path.write_text(context + raw_output, encoding="utf-8")
+```
 
-`MODEL OUTPUT · RAW TEXT` is printed before local reasoning and tool parsing.
-The vLLM Completions request asks the server not to skip special tokens.
+The newest context already contains all earlier messages, reasoning, tool calls,
+and tool results, so the trace does not need turn labels or incremental-prefix
+bookkeeping. The write happens before local output parsing, which preserves the
+raw response even if parsing fails. Set `trace_path=None` when constructing the
+Agent to disable tracing.
 
 ## Basic checks
 

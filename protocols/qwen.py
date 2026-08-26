@@ -39,14 +39,12 @@ class QwenProtocol:
         self,
         messages: list[Message],
         tools: list[dict[str, object]],
-        *,
-        add_generation_prompt: bool = True,
     ) -> str:
         rendered = self.tokenizer.apply_chat_template(
             messages,
             tools=tools,
             tokenize=False,
-            add_generation_prompt=add_generation_prompt,
+            add_generation_prompt=True,
             enable_thinking=self.enable_thinking,
             reasoning_effort=self.reasoning_effort,
             preserve_thinking=self.preserve_thinking,

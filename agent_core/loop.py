@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from .conversation import JsonConversationStore
 from .types import AgentResult, ChatProtocol, Message, TextGenerator, Tool
@@ -18,7 +19,7 @@ class Agent:
         system_prompt: str = "You are a helpful agent. Use tools when needed, and continue until the task is complete.",
         max_steps: int = 8,
         conversation_store: JsonConversationStore | None = None,
-        show_trace: bool = False,
+        trace_path: str | Path | None = None,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
@@ -32,9 +33,7 @@ class Agent:
         self.system_prompt = system_prompt
         self.max_steps = max_steps
         self.conversation_store = conversation_store
-        self.show_trace = show_trace
-        self._trace_turn = 0
-        self._traced_text = ""
+        self.trace_path = Path(trace_path) if trace_path is not None else None
 
     def run(self, prompt: str) -> AgentResult:
         messages: list[Message] = []
@@ -49,14 +48,8 @@ class Agent:
             messages = self._load_messages(messages)
             context = self.protocol.render(messages, schemas)
             raw_output = self.model.generate(context)
+            self._write_trace(context, raw_output)
             assistant = self.protocol.parse(raw_output)
-            rendered_turn = self.protocol.render(
-                [*messages, assistant],
-                schemas,
-                add_generation_prompt=False,
-            )
-            if self.show_trace:
-                self._print_trace(context, raw_output, rendered_turn)
             messages.append(assistant)
             self._save_messages(messages)
 
@@ -83,20 +76,11 @@ class Agent:
         if self.conversation_store is not None:
             self.conversation_store.save(messages)
 
-    def _print_trace(self, context: str, raw_output: str, rendered_turn: str) -> None:
-        self._trace_turn += 1
-        input_start = _common_prefix_length(self._traced_text, context)
-        title = f"AGENT TRACE · TURN {self._trace_turn}"
-        border = f"{'=' * 24} {title} {'=' * 24}"
-
-        print(f"\n{border}")
-        print("-------------------- MODEL INPUT · RENDERED TEXT --------------------")
-        print(context[input_start:])
-        print("-------------------- MODEL OUTPUT · RAW TEXT --------------------")
-        print(raw_output)
-        print("=" * len(border), flush=True)
-
-        self._traced_text = rendered_turn
+    def _write_trace(self, context: str, raw_output: str) -> None:
+        if self.trace_path is None:
+            return
+        self.trace_path.parent.mkdir(parents=True, exist_ok=True)
+        self.trace_path.write_text(context + raw_output, encoding="utf-8")
 
     def _execute_tool(self, call: object) -> Message:
         if not isinstance(call, dict):
@@ -131,12 +115,3 @@ class Agent:
             "name": name,
             "content": json.dumps(payload, ensure_ascii=False, default=str),
         }
-
-
-def _common_prefix_length(left: str, right: str) -> int:
-    length = 0
-    for left_char, right_char in zip(left, right):
-        if left_char != right_char:
-            break
-        length += 1
-    return length

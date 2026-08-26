@@ -19,8 +19,6 @@ class ChatProtocol(Protocol):
         self,
         messages: list[Message],
         tools: list[dict[str, object]],
-        *,
-        add_generation_prompt: bool = True,
     ) -> str:
         """Render structured messages into the model's text context."""
 
