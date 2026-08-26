@@ -38,6 +38,32 @@ These features can be built around the core loop later, but are kept out of the
 current implementation so that its essential architecture remains easy to
 study.
 
+## Project Structure
+
+```text
+pi_qwen/
+├── AGENTS.md              # Runtime system instructions for the model
+├── main.py                # CLI configuration and dependency assembly
+├── agent_core/            # Model-independent agent components
+│   ├── __init__.py        # Public agent-core exports
+│   ├── conversation.py    # JSON-backed conversation persistence
+│   ├── loop.py            # Core generate, tool execution, and repeat loop
+│   └── types.py           # Shared messages, interfaces, tools, and results
+├── backends/              # Text-generation backends
+│   ├── __init__.py        # Public backend exports
+│   └── vllm.py            # Raw generation through the vLLM Completions API
+├── protocols/             # Model-family context adapters
+│   ├── __init__.py        # Public protocol exports
+│   └── qwen.py            # Qwen chat-template rendering and output parsing
+├── tools/                 # Tools exposed to the model
+│   ├── __init__.py        # Default tool registry
+│   ├── coding.py          # read, bash, edit, and write tools
+│   └── web_search.py      # DuckDuckGo web search tool
+├── requirements.txt       # Agent-client Python dependencies
+├── README.md              # Project overview and usage
+└── tmp/                   # Git-ignored conversations and raw traces
+```
+
 ## Supported Model
 
 The current implementation supports:
@@ -134,3 +160,8 @@ complete model trace are written to:
 ./tmp/conversation.json
 ./tmp/trace.txt
 ```
+
+The terminal also reports cumulative token usage across all model calls in the
+task: input tokens, output tokens, and their sum. Input usage follows the API
+counting convention, so repeated conversation history is included on every
+agent step.

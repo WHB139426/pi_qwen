@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 from .conversation import JsonConversationStore
-from .types import AgentResult, ChatProtocol, Message, TextGenerator, Tool
+from .types import AgentResult, ChatProtocol, Message, TextGenerator, TokenUsage, Tool
 
 
 class Agent:
@@ -43,11 +43,14 @@ class Agent:
         self._save_messages(messages)
 
         schemas = [tool.schema() for tool in self.tools.values()]
+        usage = TokenUsage()
 
         for step in range(1, self.max_steps + 1):
             messages = self._load_messages(messages)
             context = self.protocol.render(messages, schemas)
-            raw_output = self.model.generate(context)
+            generation = self.model.generate(context)
+            raw_output = generation.text
+            usage = usage + generation.usage
             self._write_trace(context, raw_output)
             assistant = self.protocol.parse(raw_output)
             messages.append(assistant)
@@ -59,6 +62,8 @@ class Agent:
                     answer=str(assistant.get("content", "")),
                     messages=messages,
                     steps=step,
+                    usage=usage,
+                    current_context_tokens=generation.usage.total_tokens,
                 )
 
             for call in tool_calls:

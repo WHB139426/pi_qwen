@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from agent_core import Generation, TokenUsage
+
 
 @dataclass(frozen=True)
 class VLLMOptions:
@@ -30,7 +32,7 @@ class VLLMBackend:
         self.options = options or VLLMOptions()
         self.client = OpenAI(base_url=base_url, api_key="EMPTY")
 
-    def generate(self, context: str) -> str:
+    def generate(self, context: str) -> Generation:
         temperature = self.options.temperature if self.options.do_sample else 0.0
         response = self.client.completions.create(
             model=self.model,
@@ -43,4 +45,12 @@ class VLLMBackend:
                 "skip_special_tokens": False,
             },
         )
-        return response.choices[0].text
+        if response.usage is None:
+            raise RuntimeError("vLLM response did not include token usage")
+        return Generation(
+            text=response.choices[0].text,
+            usage=TokenUsage(
+                input_tokens=response.usage.prompt_tokens,
+                output_tokens=response.usage.completion_tokens,
+            ),
+        )

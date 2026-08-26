@@ -27,9 +27,10 @@ VLLM_MODEL_NAME = "qwen3.8-27b"
 VLLM_BASE_URL = "http://127.0.0.1:8000/v1"
 CONVERSATION_PATH = Path("./tmp/conversation.json")
 TRACE_PATH = Path("./tmp/trace.txt")
+CONTEXT_WINDOW = 262_144
 
 # PROMPT = "从杭州出发，9月初，进行山西五日游，两个大人一个小孩一个老人，推荐特色美食和酒店，总预算10000之内，想要尽可能多的欣赏著名景点，但是节奏不想太赶，并考虑天气因素，请给出具体的行程路线，最后计划写成一个.md在/tmp目录下"
-PROMPT = "我想知道最新的GLM-5.3-Flash和Qwen3.8-Flash-Next这两个模型的各种相关信息，模型的细节，和性能的比较等，你可以重点搜索huggingface的网站，比较的时候把其他先进模型的性能也带上"
+PROMPT = "解读英伟达最新财报，并由此分析九月份AI相关产业的股价走势，结合历史上的数据，给出你认为比较适合投资的公司"
 ENABLE_THINKING = True
 REASONING_EFFORT = "xhigh" # xhigh, medium, low
 AGENTS_PATH = Path(__file__).with_name("AGENTS.md")
@@ -74,6 +75,13 @@ def main() -> None:
 
     print('=' * 24, 'Final Answer', '=' * 24)
     print(result.answer)
+    print('=' * 24, 'Token Usage', '=' * 25)
+    print(f"Input tokens:  {result.usage.input_tokens:,}")
+    print(f"Output tokens: {result.usage.output_tokens:,}")
+    print(f"Total tokens:  {result.usage.total_tokens:,}")
+    context_usage = result.current_context_tokens / CONTEXT_WINDOW * 100
+    print('=' * 22, 'Current Context', '=' * 22)
+    print(f"{result.current_context_tokens:,}/{CONTEXT_WINDOW:,} ({context_usage:.2f}%)")
 
 
 if __name__ == "__main__":
