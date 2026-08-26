@@ -1,10 +1,8 @@
 # Minimal Qwen Agent Loop
 
-A small, non-interactive Python agent harness for Qwen3.8. It keeps the core
-loop model-independent and supports two inference backends:
-
-- Transformers: load the local checkpoint in the Agent process.
-- vLLM: call a separately deployed OpenAI-compatible model server.
+A small, non-interactive Python agent harness for Qwen3.8. The harness owns
+message persistence, context construction, output parsing, and tool execution;
+a separately deployed vLLM server only performs text generation.
 
 ```text
 user task
@@ -27,35 +25,58 @@ pi_qwen/
 ├── AGENTS.md             Runtime instructions loaded as the system message
 ├── main.py               Configuration and dependency assembly
 ├── agent_core/
+│   ├── conversation.py   JSON-backed conversation storage
 │   ├── loop.py           Model-independent agent loop
-│   └── types.py          Message, Tool, ChatModel, and AgentResult types
-├── models/
-│   ├── qwen.py           In-process Transformers adapter
-│   └── vllm.py           OpenAI-compatible vLLM adapter
+│   └── types.py          Message, Tool, TextGenerator, and ChatProtocol types
+├── backends/
+│   └── vllm.py           vLLM raw Completions client
+├── protocols/
+│   └── qwen.py           Qwen context rendering and output parsing
 └── tools/
     ├── coding.py         read, bash, edit, and write
     └── web_search.py     DuckDuckGo HTML search
 ```
 
-Both model adapters implement the same interface:
+The vLLM adapter is deliberately unaware of messages and tools. It implements
+the minimal text-generation interface:
 
 ```python
-complete(messages, tools) -> assistant_message
+generate(context: str) -> raw_text
 ```
 
-The `Agent` therefore does not need to know whether inference happens in the
-same process or behind an HTTP server.
+`QwenProtocol` owns the model-family-specific boundary:
+
+```python
+render(messages, tools) -> context
+parse(raw_text) -> assistant_message
+```
+
+The `Agent` constructs the complete context before inference, while vLLM only
+tokenizes and generates from the supplied text.
 
 ## Agent loop
 
 `Agent.run()` creates a system message from `AGENTS.md`, appends the user task,
 and builds the tool schemas once. Each step then:
 
-1. Sends the complete message history and tool schemas to the model.
-2. Appends the returned assistant message.
-3. Returns the assistant content if there are no tool calls.
-4. Otherwise executes every requested tool and appends its result.
-5. Repeats until an answer is produced or `max_steps` is exceeded.
+1. Reloads the complete message history from JSON.
+2. Uses `QwenProtocol` to render messages, tools, thinking settings, and the
+   Qwen chat template into one text context.
+3. Sends only that context to the selected text-generation backend.
+4. Parses the raw text into reasoning, content, and tool calls locally.
+5. Saves the assistant message, executes any tools, and saves their results.
+6. Repeats until an answer is produced or `max_steps` is exceeded.
+
+`main.py` configures `./tmp/conversation.json` as the conversation store. The
+loop writes every assistant message and tool result immediately, then reloads
+the complete file before each model call. The JSON file is therefore the
+authoritative cross-turn history; Python still creates a temporary list when it
+deserializes the file for a model request.
+
+Each `main.py` run starts a new conversation and overwrites the previous file.
+The final record remains available after the process exits. `tmp/*` is ignored
+by Git, and the store uses a temporary sibling file plus an atomic replace to
+avoid leaving partially written JSON after an interrupted write.
 
 Tool results use this internal shape:
 
@@ -68,11 +89,10 @@ Tool results use this internal shape:
 }
 ```
 
-The harness stores tool arguments as Python dictionaries. The vLLM adapter
-serializes historical arguments to JSON strings before an API request and
-parses returned argument strings back into dictionaries before tool execution.
-It also normalizes the vLLM 0.28 `reasoning` response field to the internal
-`reasoning_content` field so thinking can be preserved in later turns.
+The harness stores tool arguments as Python dictionaries. `QwenProtocol`
+renders those dictionaries into Qwen's XML tool-call format and parses the
+model's XML back into dictionaries before execution. Reasoning is likewise
+parsed locally and stored as `reasoning_content` for later turns.
 
 ## Tools
 
@@ -99,7 +119,6 @@ The main defaults are defined near the top of `main.py`:
 
 ```python
 MODEL_PATH = "/data4/haibo/weights/Qwen3.8-27B"
-BACKEND = "vllm"  # "vllm" or "transformers"
 VLLM_MODEL_NAME = "qwen3.8-27b"
 VLLM_BASE_URL = "http://127.0.0.1:8000/v1"
 
@@ -147,10 +166,7 @@ CUDA_VISIBLE_DEVICES=0 vllm serve /data4/haibo/weights/Qwen3.8-27B \
     --dtype bfloat16 \
     --tensor-parallel-size 1 \
     --max-model-len 262144 \
-    --gpu-memory-utilization 0.90 \
-    --reasoning-parser qwen3 \
-    --enable-auto-tool-choice \
-    --tool-call-parser qwen3_coder
+    --gpu-memory-utilization 0.90
 ```
 
 Verify that the service is ready:
@@ -169,29 +185,11 @@ pip install -r requirements.txt
 python main.py
 ```
 
-The client does not load model weights. When tracing is enabled it only loads
-the local processor/tokenizer so it can render the same Qwen chat template used
-by the server.
-
-## Run with Transformers
-
-Change the backend in `main.py`:
-
-```python
-BACKEND = "transformers"
-```
-
-Then run:
-
-```bash
-conda activate pi_agent
-cd /data4/haibo/code/pi_qwen
-python main.py --max-new-tokens 8192
-```
-
-The current Transformers adapter requests `flash_attention_3`, so that package
-must be installed in `pi_agent`. The optional linear-attention packages listed
-in `requirements.txt` remove the Qwen fallback warning and may improve speed.
+The client does not load model weights. `QwenProtocol` loads only the local
+tokenizer and renders the complete prompt before calling vLLM's
+`/v1/completions` endpoint. The request contains `prompt`, sampling parameters,
+and the served model name; it contains no `messages`, `tools`, `tool_choice`, or
+`chat_template_kwargs` fields.
 
 ## Thinking and reasoning
 
@@ -201,9 +199,10 @@ Qwen3.8 supports thinking mode and three reasoning-effort levels:
 - `medium`: uses the template's balanced baseline behavior.
 - `low`: adds an instruction encouraging brief, focused reasoning.
 
-`REASONING_EFFORT` only affects the prompt while `ENABLE_THINKING` is true. It
-is a soft behavioral control, not a hard token budget. `max_new_tokens` or the
-vLLM API's `max_tokens` remains the generation limit.
+`REASONING_EFFORT` is consumed by `QwenProtocol` while it renders the prompt and
+only has an effect while `ENABLE_THINKING` is true. It is a soft behavioral
+control, not a hard token budget. `max_new_tokens` or the vLLM API's
+`max_tokens` remains the generation limit.
 
 With `preserve_thinking=True`, historical reasoning is included in later model
 turns. This can improve plan continuity in multi-step tasks, while also
@@ -211,22 +210,18 @@ increasing context usage.
 
 ## Trace output
 
-Both backends print immediately after each completed model turn and avoid
-repeating the common prefix from earlier turns.
+Tracing belongs to the Agent rather than the vLLM adapter. It prints immediately
+after each completed model turn and avoids repeating the common context prefix
+from earlier turns.
 
-The Transformers adapter decodes its actual input and output token IDs with
-`skip_special_tokens=False`. Its trace therefore includes raw markers such as
-`<|im_start|>`, `<|im_end|>`, `<think>`, and `<tool_call>`.
+`MODEL INPUT · RENDERED TEXT` is the exact context string produced by
+`QwenProtocol` and passed to `generate()`. It includes markers such as
+`<|im_start|>`, `<|im_end|>`, `<think>`, `<tool_call>`, and `<tool_response>`, as
+well as the reasoning instruction, tool schemas, `AGENTS.md`, and message
+history.
 
-The vLLM adapter has no direct access to the remote engine's input tensor. It
-uses the local Qwen processor with `apply_chat_template(tokenize=False)` to
-print the template-rendered text sent conceptually to the model. This includes
-the reasoning instruction, tool schemas, `AGENTS.md`, message history, tool
-calls, and tool results.
-
-The vLLM output section is reconstructed from the parsed API response. It
-preserves reasoning, content, and structured tool calls, but it is not a
-byte-for-byte copy of the model's pre-parser output whitespace.
+`MODEL OUTPUT · RAW TEXT` is printed before local reasoning and tool parsing.
+The vLLM Completions request asks the server not to skip special tokens.
 
 ## Basic checks
 
@@ -237,6 +232,7 @@ without loading the model:
 python -m py_compile \
     main.py \
     agent_core/*.py \
-    models/*.py \
+    backends/*.py \
+    protocols/*.py \
     tools/*.py
 ```

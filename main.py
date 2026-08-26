@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from agent_core import Agent
-from models import GenerationOptions, QwenModel, VLLMModel, VLLMOptions
+from agent_core import Agent, JsonConversationStore
+from backends import VLLMBackend, VLLMOptions
+from protocols import QwenProtocol
 from tools import TOOLS
 
 
@@ -18,19 +19,16 @@ CUDA_VISIBLE_DEVICES=0 vllm serve /data4/haibo/weights/Qwen3.8-27B \
     --dtype bfloat16 \
     --tensor-parallel-size 1 \
     --max-model-len 262144 \
-    --gpu-memory-utilization 0.90 \
-    --reasoning-parser qwen3 \
-    --enable-auto-tool-choice \
-    --tool-call-parser qwen3_coder
+    --gpu-memory-utilization 0.90
 """
 
 MODEL_PATH = "/data4/haibo/weights/Qwen3.8-27B"
-BACKEND = "vllm"  # "vllm" or "transformers"
 VLLM_MODEL_NAME = "qwen3.8-27b"
 VLLM_BASE_URL = "http://127.0.0.1:8000/v1"
+CONVERSATION_PATH = Path("./tmp/conversation.json")
 
-PROMPT = "从杭州出发，9月初，进行山西五日游，两个大人一个小孩一个老人，推荐特色美食和酒店，总预算10000之内，想要尽可能多的欣赏著名景点，但是节奏不想太赶，并考虑天气因素，请给出具体的行程路线，最后计划写成一个.md在/tmp目录下"
-PROMPT = "你知道这几天的GTA6泄露事件吗"
+# PROMPT = "从杭州出发，9月初，进行山西五日游，两个大人一个小孩一个老人，推荐特色美食和酒店，总预算10000之内，想要尽可能多的欣赏著名景点，但是节奏不想太赶，并考虑天气因素，请给出具体的行程路线，最后计划写成一个.md在/tmp目录下"
+PROMPT = "皇马最新一轮西甲比赛的过程结果，以及赛后新闻发布会的内容"
 ENABLE_THINKING = True
 REASONING_EFFORT = "xhigh" # xhigh, medium, low
 SHOW_RAW_TRACE = True
@@ -48,35 +46,28 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=32*1024)
     args = parser.parse_args()
 
-    if BACKEND == "transformers":
-        model = QwenModel(
-            args.model,
-            options=GenerationOptions(
-                max_new_tokens=args.max_new_tokens,
-                enable_thinking=ENABLE_THINKING,
-                reasoning_effort=REASONING_EFFORT,
-            ),
-            show_raw_trace=SHOW_RAW_TRACE,
-        )
-    elif BACKEND == "vllm":
-        model = VLLMModel(
-            args.model,
-            served_model_name=VLLM_MODEL_NAME,
-            base_url=VLLM_BASE_URL,
-            options=VLLMOptions(
-                max_tokens=args.max_new_tokens,
-                enable_thinking=ENABLE_THINKING,
-                reasoning_effort=REASONING_EFFORT,
-            ),
-            show_trace=SHOW_RAW_TRACE,
-        )
-    else:
-        raise ValueError(f"unknown backend: {BACKEND}")
+    protocol = QwenProtocol(
+        args.model,
+        enable_thinking=ENABLE_THINKING,
+        reasoning_effort=REASONING_EFFORT,
+        preserve_thinking=True,
+    )
+
+    model = VLLMBackend(
+        VLLM_MODEL_NAME,
+        base_url=VLLM_BASE_URL,
+        options=VLLMOptions(
+            max_tokens=args.max_new_tokens,
+        ),
+    )
     agent = Agent(
         model,
         TOOLS,
+        protocol=protocol,
         system_prompt=load_agent_instructions(),
         max_steps=args.max_steps,
+        conversation_store=JsonConversationStore(CONVERSATION_PATH),
+        show_trace=SHOW_RAW_TRACE,
     )
 
     result = agent.run(args.prompt)

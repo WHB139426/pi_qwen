@@ -9,9 +9,23 @@ from typing import Callable, Protocol
 Message = dict[str, object]
 
 
-class ChatModel(Protocol):
-    def complete(self, messages: list[Message], tools: list[dict[str, object]]) -> Message:
-        """Return one assistant message."""
+class TextGenerator(Protocol):
+    def generate(self, context: str) -> str:
+        """Generate raw text from a fully constructed context."""
+
+
+class ChatProtocol(Protocol):
+    def render(
+        self,
+        messages: list[Message],
+        tools: list[dict[str, object]],
+        *,
+        add_generation_prompt: bool = True,
+    ) -> str:
+        """Render structured messages into the model's text context."""
+
+    def parse(self, text: str) -> Message:
+        """Parse raw generated text into one assistant message."""
 
 
 @dataclass(frozen=True)
