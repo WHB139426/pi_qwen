@@ -49,9 +49,9 @@ class QwenModel:
         self.model = Qwen3_5ForConditionalGeneration.from_pretrained(
             model_path,
             dtype=torch.bfloat16,
-            # device_map=device_map,
+            device_map=device_map,
             attn_implementation="flash_attention_3",
-        ).eval().to('cuda:0')
+        ).eval()
         self.input_device = next(self.model.parameters()).device
 
     def complete(self, messages: list[Message], tools: list[dict[str, object]]) -> Message:

@@ -2,6 +2,7 @@ torch==2.11.0
 torchvision==0.26.0 
 transformers==5.12.0
 accelerate
+openai
 
 # pip install flash_attn_3 --find-links https://windreamer.github.io/flash-attention3-wheels/cu130_torch2110
 # pip install --no-build-isolation causal-conv1d
