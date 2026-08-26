@@ -1,6 +1,6 @@
 # Minimal Qwen Agent
 
-A minimal Python agent harness inspired by **pi**. It demonstrates the essential
+A minimal Python agent harness inspired by [**pi**](https://github.com/earendil-works/pi). It demonstrates the essential
 agent loop: the model decides whether to call a tool, the harness executes it
 and returns the result, and the model continues until it produces a final
 answer.
@@ -83,6 +83,7 @@ pip install -r requirements.txt
 The model is deployed with tensor parallelism across four NVIDIA H200 GPUs:
 
 ```bash
+conda activate vllm
 CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3.8-27B \
     --served-model-name qwen3.8-27b \
     --host 127.0.0.1 \
@@ -106,7 +107,7 @@ python main.py \
 To run the task configured in `main.py`:
 
 ```bash
-python main.py --model Qwen/Qwen3.8-27B
+python main.py
 ```
 
 The final answer is printed to the terminal. The structured conversation and
