@@ -1,153 +1,52 @@
-# Minimal Qwen Agent Loop
+# Minimal Qwen Agent
 
-A small, non-interactive Python agent harness for Qwen3.8. The harness owns
-message persistence, context construction, output parsing, and tool execution;
-a separately deployed vLLM server only performs text generation.
+一个用 Python 编写的极简 Agent harness，用来展示最核心的 Agent Loop：
+模型根据任务决定是否调用工具，程序执行工具并返回结果，模型继续推理，直到给出最终答案。
 
-```text
-user task
-   -> model
-   -> optional tool calls
-   -> local tool execution
-   -> tool results
-   -> model
-   -> final answer
-```
+## 设计思想
 
-There is no interactive UI, session database, sandbox, or approval layer. The
-project is intentionally small enough to use as a reference implementation of
-an agent loop.
+这个项目追求简单、清晰和可替换：
 
-## Project structure
+- Agent Loop 只负责消息流转、工具执行和循环控制，不依赖具体模型。
+- `conversation.json` 使用 harness 自己的统一消息格式，不保存某个模型专用的 prompt 文本。
+- 模型协议负责在统一消息与模型原生格式之间进行转换。目前的 `QwenProtocol` 负责 Qwen chat template 的渲染与输出解析。
+- 推理后端只接收完整 context 并返回原始文本。目前使用 vLLM 的 Completions API。
+- 工具通过统一的 `Tool` 接口注册，可以独立增加或删除。
 
-```text
-pi_qwen/
-├── AGENTS.md             Runtime instructions loaded as the system message
-├── main.py               Configuration and dependency assembly
-├── agent_core/
-│   ├── conversation.py   JSON-backed conversation storage
-│   ├── loop.py           Model-independent agent loop
-│   └── types.py          Message, Tool, TextGenerator, and ChatProtocol types
-├── backends/
-│   └── vllm.py           vLLM raw Completions client
-├── protocols/
-│   └── qwen.py           Qwen context rendering and output parsing
-└── tools/
-    ├── coding.py         read, bash, edit, and write
-    └── web_search.py     DuckDuckGo HTML search
-```
+因此，接入工具调用格式不同的新模型时，主要新增对应的 protocol；Agent Loop 和工具实现通常不需要改变。
 
-The vLLM adapter is deliberately unaware of messages and tools. It implements
-the minimal text-generation interface:
+## 支持的模型
 
-```python
-generate(context: str) -> raw_text
-```
+当前支持并配置的是：
 
-`QwenProtocol` owns the model-family-specific boundary:
+- Qwen3.8-27B
+- vLLM 推理后端
 
-```python
-render(messages, tools) -> context
-parse(raw_text) -> assistant_message
-```
-
-The `Agent` constructs the complete context before inference, while vLLM only
-tokenizes and generates from the supplied text.
-
-## Agent loop
-
-`Agent.run()` creates a system message from `AGENTS.md`, appends the user task,
-and builds the tool schemas once. Each step then:
-
-1. Reloads the complete message history from JSON.
-2. Uses `QwenProtocol` to render messages, tools, thinking settings, and the
-   Qwen chat template into one text context.
-3. Sends only that context to the selected text-generation backend.
-4. Parses the raw text into reasoning, content, and tool calls locally.
-5. Saves the assistant message, executes any tools, and saves their results.
-6. Repeats until an answer is produced or `max_steps` is exceeded.
-
-`main.py` configures `./tmp/conversation.json` as the conversation store. The
-loop writes every assistant message and tool result immediately, then reloads
-the complete file before each model call. The JSON file is therefore the
-authoritative cross-turn history; Python still creates a temporary list when it
-deserializes the file for a model request.
-
-Each `main.py` run starts a new conversation and overwrites the previous file.
-The final record remains available after the process exits. `tmp/*` is ignored
-by Git, and the store uses a temporary sibling file plus an atomic replace to
-avoid leaving partially written JSON after an interrupted write.
-
-Tool results use this internal shape:
-
-```python
-{
-    "role": "tool",
-    "tool_call_id": "call_...",
-    "name": "read",
-    "content": "{\"ok\": true, \"result\": ...}",
-}
-```
-
-The harness stores tool arguments as Python dictionaries. `QwenProtocol`
-renders those dictionaries into Qwen's XML tool-call format and parses the
-model's XML back into dictionaries before execution. Reasoning is likewise
-parsed locally and stored as `reasoning_content` for later turns.
-
-## Tools
-
-The default registry contains:
-
-- `read`: read a UTF-8 file with optional line offset and limit.
-- `bash`: execute a Bash command in the current working directory.
-- `edit`: replace one exact, uniquely matching block in a UTF-8 file.
-- `write`: create or completely overwrite a UTF-8 file.
-- `web_search`: query DuckDuckGo and return titles, URLs, and snippets.
-
-Text and shell output is truncated at 50 KiB before it is returned to the
-model. `web_search` returns at most ten results and does not require an API key,
-but DuckDuckGo's HTML endpoint is not a guaranteed stable production API.
-
-The coding tools run with the same filesystem and process permissions as
-`main.py`. Treat model-generated shell commands and file writes as trusted code
-only in a controlled environment. Runtime instructions ask the model to place
-temporary scripts, downloads, and intermediate artifacts under `./tmp/`.
-
-## Configuration
-
-The main defaults are defined near the top of `main.py`:
+默认配置位于 `main.py`：
 
 ```python
 MODEL_PATH = "/data4/haibo/weights/Qwen3.8-27B"
 VLLM_MODEL_NAME = "qwen3.8-27b"
 VLLM_BASE_URL = "http://127.0.0.1:8000/v1"
-
-ENABLE_THINKING = True
-REASONING_EFFORT = "xhigh"  # "xhigh", "medium", or "low"
-TRACE_PATH = Path("./tmp/trace.txt")
 ```
 
-The local model path and the vLLM served name have different purposes:
+`MODEL_PATH` 用于读取 tokenizer 和 chat template，`VLLM_MODEL_NAME` 必须与 vLLM 的 `--served-model-name` 一致。
 
-- `MODEL_PATH` locates the checkpoint and its Qwen chat template.
-- `VLLM_MODEL_NAME` must match the server's `--served-model-name` value.
-- `VLLM_BASE_URL` points to the OpenAI-compatible API.
+## 支持的工具
 
-Command-line options override the task, local model path, step limit, and output
-limit:
+- `read`：读取 UTF-8 文本文件。
+- `bash`：执行 Bash 命令。
+- `edit`：替换文件中唯一匹配的文本块。
+- `write`：创建或覆盖 UTF-8 文本文件。
+- `web_search`：通过 DuckDuckGo 搜索网页。
 
-```bash
-python main.py \
-    --prompt "Inspect this repository and summarize its architecture." \
-    --model /data4/haibo/weights/Qwen3.8-27B \
-    --max-steps 20 \
-    --max-new-tokens 8192
-```
+这些工具直接使用运行 `main.py` 的进程权限，没有额外的沙箱或人工确认机制，请在受控环境中运行。
 
-## Run with vLLM
+## 安装
 
-Use a separate environment for the model server so its PyTorch and CUDA
-dependencies do not replace packages in `pi_agent`:
+建议分别创建 vLLM 服务端环境和 Agent 客户端环境。
+
+安装 vLLM：
 
 ```bash
 conda create -n vllm python=3.12 -y
@@ -156,7 +55,18 @@ python -m pip install --upgrade pip uv
 uv pip install vllm --torch-backend=auto
 ```
 
-Start Qwen3.8-27B and keep this terminal running:
+安装 Agent 客户端：
+
+```bash
+conda create -n pi_agent python=3.12 -y
+conda activate pi_agent
+cd /data4/haibo/code/pi_qwen
+pip install -r requirements.txt
+```
+
+## 运行
+
+先启动 vLLM 服务：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 vllm serve /data4/haibo/weights/Qwen3.8-27B \
@@ -169,71 +79,23 @@ CUDA_VISIBLE_DEVICES=0 vllm serve /data4/haibo/weights/Qwen3.8-27B \
     --gpu-memory-utilization 0.90
 ```
 
-Verify that the service is ready:
+然后在另一个终端运行 Agent：
 
 ```bash
-curl http://127.0.0.1:8000/v1/models
-```
-
-In another terminal, run the Agent client:
-
-```bash
-conda create -n pi_agent python=3.12 -y
 conda activate pi_agent
 cd /data4/haibo/code/pi_qwen
-pip install -r requirements.txt
+python main.py --prompt "搜索今天的重要 AI 新闻并总结"
+```
+
+也可以使用默认任务：
+
+```bash
 python main.py
 ```
 
-The client does not load model weights. `QwenProtocol` loads only the local
-tokenizer and renders the complete prompt before calling vLLM's
-`/v1/completions` endpoint. The request contains `prompt`, sampling parameters,
-and the served model name; it contains no `messages`, `tools`, `tool_choice`, or
-`chat_template_kwargs` fields.
+最终答案打印在终端。结构化对话记录和完整模型 trace 分别保存在：
 
-## Thinking and reasoning
-
-Qwen3.8 supports thinking mode and three reasoning-effort levels:
-
-- `xhigh`: adds an instruction encouraging thorough analysis.
-- `medium`: uses the template's balanced baseline behavior.
-- `low`: adds an instruction encouraging brief, focused reasoning.
-
-`REASONING_EFFORT` is consumed by `QwenProtocol` while it renders the prompt and
-only has an effect while `ENABLE_THINKING` is true. It is a soft behavioral
-control, not a hard token budget. `max_new_tokens` or the vLLM API's
-`max_tokens` remains the generation limit.
-
-With `preserve_thinking=True`, historical reasoning is included in later model
-turns. This can improve plan continuity in multi-step tasks, while also
-increasing context usage.
-
-## Trace output
-
-The Agent writes tracing to `./tmp/trace.txt` instead of the terminal. After
-each generation it overwrites the file with the complete rendered context plus
-the raw model output:
-
-```python
-trace_path.write_text(context + raw_output, encoding="utf-8")
-```
-
-The newest context already contains all earlier messages, reasoning, tool calls,
-and tool results, so the trace does not need turn labels or incremental-prefix
-bookkeeping. The write happens before local output parsing, which preserves the
-raw response even if parsing fails. Set `trace_path=None` when constructing the
-Agent to disable tracing.
-
-## Basic checks
-
-The repository currently has no automated test suite. Syntax can be checked
-without loading the model:
-
-```bash
-python -m py_compile \
-    main.py \
-    agent_core/*.py \
-    backends/*.py \
-    protocols/*.py \
-    tools/*.py
+```text
+./tmp/conversation.json
+./tmp/trace.txt
 ```

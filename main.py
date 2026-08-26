@@ -29,7 +29,7 @@ CONVERSATION_PATH = Path("./tmp/conversation.json")
 TRACE_PATH = Path("./tmp/trace.txt")
 
 # PROMPT = "从杭州出发，9月初，进行山西五日游，两个大人一个小孩一个老人，推荐特色美食和酒店，总预算10000之内，想要尽可能多的欣赏著名景点，但是节奏不想太赶，并考虑天气因素，请给出具体的行程路线，最后计划写成一个.md在/tmp目录下"
-PROMPT = "皇马最新一轮西甲比赛的过程结果，以及赛后新闻发布会的内容"
+PROMPT = "我想知道最新的GLM-5.3-Flash和Qwen3.8-Flash-Next这两个模型的各种相关信息，模型的细节，和性能的比较等"
 ENABLE_THINKING = True
 REASONING_EFFORT = "xhigh" # xhigh, medium, low
 AGENTS_PATH = Path(__file__).with_name("AGENTS.md")
@@ -43,7 +43,7 @@ def main() -> None:
     parser.add_argument("--prompt", default=PROMPT)
     parser.add_argument("--model", default=MODEL_PATH)
     parser.add_argument("--max-steps", type=int, default=100)
-    parser.add_argument("--max-new-tokens", type=int, default=32*1024)
+    parser.add_argument("--max-new-tokens", type=int, default=128*1024)
     args = parser.parse_args()
 
     protocol = QwenProtocol(
