@@ -21,6 +21,23 @@ The project is designed to remain small, explicit, and replaceable:
 Supporting a model with a different tool-calling format should mainly require a
 new protocol implementation, while leaving the core agent loop unchanged.
 
+## Scope and Limitations
+
+This repository is intended for learning and research. It deliberately focuses
+on the smallest useful agent loop rather than a production-ready agent product.
+It currently does not provide:
+
+- A web, desktop, or terminal user interface.
+- Interactive multi-turn chat or streaming output.
+- Context compaction, summarization, or automatic token-budget management.
+- Task interruption, pause, resume, cancellation, or cross-run recovery.
+- Human-in-the-loop interaction or approval before tool execution.
+- Tool sandboxing, permission isolation, or other production security controls.
+
+These features can be built around the core loop later, but are kept out of the
+current implementation so that its essential architecture remains easy to
+study.
+
 ## Supported Model
 
 The current implementation supports:
