@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
 from pathlib import Path
 
 from agent_core import Agent, JsonConversationStore
@@ -34,7 +33,7 @@ sudo docker run --rm \
     --ipc=host \
     --network host \
     -e VLLM_ENGINE_READY_TIMEOUT_S=3600 \
-    -v /path/to/GLM-5.3-Flash:/model:ro \
+    -v /data4/haibo/weights/GLM-5.3-Flash:/model:ro \
     vllm/vllm-openai:glm53-flash \
     /model \
     --served-model-name glm-5.3-flash \
@@ -100,14 +99,40 @@ VLLM_BASE_URL = MODEL_CONFIG["vllm_base_url"]
 CONVERSATION_PATH = Path("./tmp/conversation.json")
 TRACE_PATH = Path("./tmp/trace.txt")
 
-# PROMPT = "从杭州出发，9月初，进行山西五日游，两个大人一个小孩一个老人，推荐特色美食和酒店，总预算10000之内，想要尽可能多的欣赏著名景点，但是节奏不想太赶，并考虑天气因素，请给出具体的行程路线，最后计划写成一个.md在/tmp目录下"
-PROMPT = "解读英伟达最新财报，并由此分析九月份AI相关产业的股价走势，结合历史上的数据，给出你认为比较适合投资的公司"
-PROMPT = "你知道GLM5.3 FLASH这个模型吗, 详细介绍一下，比较他和其他先进模型的性能比较，并且告诉我官方推荐推理参数的最优设置，比如temperature， topp/k那些"
+PROMPT = "9月初从上海出发，意大利入，法国出。情侣两人，帮我规划意大利，瑞士，法国的十二日行程，节奏不要太赶，喜欢拍照出片，体验当地人文特色，预算总共4w以内，推荐酒店以及特色美食，但是不要吃太奇怪的食物，考虑天气因素，给我一份具体规划路线，最后计划写成一个.md在./tmp目录下. 在写计划的时候，记得标注新闻、报道、信息以及数据这些东西的来源"
+# PROMPT = "解读英伟达最新财报，并由此分析九月份AI相关产业的股价走势，结合历史上的数据，给出你认为比较适合投资的公司，最后计划写成一个.md在 ./tmp目录下。在写计划的时候，记得标注新闻、报道、信息以及数据这些东西的来源"
 AGENTS_PATH = Path(__file__).with_name("AGENTS.md")
 
 
 def load_agent_instructions() -> str:
     return AGENTS_PATH.read_text(encoding="utf-8")
+
+
+def create_agent(
+    *,
+    model_path: str = MODEL_PATH,
+    max_steps: int = 100,
+    conversation_path: str | Path = CONVERSATION_PATH,
+    trace_path: str | Path = TRACE_PATH,
+) -> Agent:
+    protocol = MODEL_CONFIG["protocol"](
+        model_path,
+        **MODEL_CONFIG["protocol_options"],
+    )
+    model = VLLMBackend(
+        VLLM_MODEL_NAME,
+        base_url=VLLM_BASE_URL,
+        options=MODEL_CONFIG["vllm_options"],
+    )
+    return Agent(
+        model,
+        TOOLS,
+        protocol=protocol,
+        system_prompt=load_agent_instructions(),
+        max_steps=max_steps,
+        conversation_store=JsonConversationStore(conversation_path),
+        trace_path=trace_path,
+    )
 
 
 def main() -> None:
@@ -117,26 +142,9 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, default=100)
     args = parser.parse_args()
 
-    protocol = MODEL_CONFIG["protocol"](
-        args.model,
-        **MODEL_CONFIG["protocol_options"],
-    )
-
-    model = VLLMBackend(
-        VLLM_MODEL_NAME,
-        base_url=VLLM_BASE_URL,
-        options=replace(
-            MODEL_CONFIG["vllm_options"],
-        ),
-    )
-    agent = Agent(
-        model,
-        TOOLS,
-        protocol=protocol,
-        system_prompt=load_agent_instructions(),
+    agent = create_agent(
+        model_path=args.model,
         max_steps=args.max_steps,
-        conversation_store=JsonConversationStore(CONVERSATION_PATH),
-        trace_path=TRACE_PATH,
     )
 
     result = agent.run(args.prompt)

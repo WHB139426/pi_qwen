@@ -29,6 +29,8 @@ Do not stop immediately after a tool call. Use its result to continue the task.
 - When no dedicated tool exists, use the Bash tool to write or run a small
   Python or shell program for calculations, data processing, API calls, or
   other necessary results.
+- Perform all file creation, reading, modification, and deletion only within
+  `./tmp/`. Do not access files outside this directory.
 - Put every temporary script, intermediate artifact, API response, and download
   under `./tmp/`. Create that directory when needed; do not scatter temporary
   files in the working directory.

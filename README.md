@@ -55,6 +55,7 @@ pi_qwen/
 ├── protocols/             # Model-family context adapters
 │   ├── __init__.py        # Public protocol exports
 │   └── qwen.py            # Qwen chat-template rendering and output parsing
+│   └── glm.py             # GLM chat-template rendering and output parsing
 ├── tools/                 # Tools exposed to the model
 │   ├── __init__.py        # Default tool registry
 │   ├── coding.py          # read, bash, edit, and write tools
