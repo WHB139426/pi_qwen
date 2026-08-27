@@ -986,6 +986,7 @@ button, select {{ color: inherit; }}
 .composer textarea::placeholder {{ color: #777; }}
 .composer-footer {{ display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }}
 .composer-left {{ display: flex; min-width: 0; align-items: center; gap: 0.45rem; }}
+.composer-right {{ display: flex; flex: 0 0 auto; align-items: center; gap: 0.45rem; }}
 .upload-button {{ display: grid; width: 2.35rem; height: 2.35rem; flex: 0 0 auto; place-items: center; border: 1px solid #3b3b3b; border-radius: 50%; color: #aaa; background: #181818; cursor: pointer; font-size: 1.25rem; line-height: 1; }}
 .upload-button:hover {{ color: #eee; border-color: #555; }}
 .upload-button:disabled {{ cursor: wait; opacity: 0.45; }}
@@ -1057,6 +1058,9 @@ button, select {{ color: inherit; }}
 <div class="composer-footer">
 <div class="composer-left">
 <button id="upload-button" class="upload-button" type="button" aria-label="Upload files" title="Upload files">+</button>
+<span id="upload-status" class="upload-status" role="status" hidden></span>
+</div>
+<div class="composer-right">
 <div class="effort-control">
 <label class="sr-only" for="reasoning-effort">Reasoning effort</label>
 <div class="effort-display" aria-hidden="true">
@@ -1064,9 +1068,8 @@ button, select {{ color: inherit; }}
 </div>
 <select id="reasoning-effort" name="reasoning_effort">{reasoning_options}</select>
 </div>
-<span id="upload-status" class="upload-status" role="status" hidden></span>
-</div>
 <button id="send-button" class="send-button" type="submit" aria-label="Send">&#8593;</button>
+</div>
 </div>
 </form>
 {usage_html}

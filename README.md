@@ -1,107 +1,125 @@
-# Minimal Qwen Agent
+# Minimal Python Agent Harness
 
-A minimal Python agent harness inspired by [**pi**](https://github.com/earendil-works/pi). It demonstrates the essential
-agent loop: the model decides whether to call a tool, the harness executes it
-and returns the result, and the model continues until it produces a final
-answer.
+A small Python agent harness inspired by [pi](https://github.com/earendil-works/pi).
+It keeps the core loop explicit: a model generates text, the harness parses tool
+calls, executes them, appends the results, and continues until the model returns
+a final answer.
 
-## Design Philosophy
+## Design
 
-The project is designed to remain small, explicit, and replaceable:
+- The agent loop is independent of any particular model family or inference
+  server.
+- `conversation.json` is the harness's model-independent message protocol.
+- Model protocols translate between those messages and model-specific text
+  formats. Qwen and GLM currently have separate renderers and parsers.
+- The vLLM backend receives a fully rendered text context and streams raw text
+  back. It does not construct messages or tool definitions.
+- Tools use one small interface and can be added without changing the loop.
+- The CLI and Web application are clients around the same agent core.
 
-- The agent loop handles message flow, tool execution, and iteration without
-  depending on a particular model.
-- `conversation.json` stores the harness's model-independent message format.
-- A model protocol translates between those messages and a model-specific chat
-  template. `QwenProtocol` currently renders and parses the Qwen format.
-- The inference backend receives a complete text context and returns raw text.
-  It does not construct messages or tools.
-- Tools share one small interface and can be added or removed independently.
+Supporting a model with a different chat template or tool-call syntax should
+mainly require a new protocol implementation rather than a new agent loop.
 
-Supporting a model with a different tool-calling format should mainly require a
-new protocol implementation, while leaving the core agent loop unchanged.
+## Scope
 
-## Scope and Limitations
+This repository is for learning and research, not production deployment. It now
+includes an interactive CLI and a lightweight multi-user Web application, but
+intentionally omits several product-level features:
 
-This repository is intended for learning and research. It deliberately focuses
-on the smallest useful agent loop rather than a production-ready agent product.
-It currently does not provide:
+- context compaction, summarization, and automatic token-budget management;
+- pause, resume, cancellation, and mid-tool human approval;
+- an operating-system sandbox for model tools;
+- a production database, persistent login sessions, rate limiting, CSRF
+  protection, and administrative controls.
 
-- A web, desktop, or terminal user interface.
-- Interactive multi-turn chat or streaming output.
-- Context compaction, summarization, or automatic token-budget management.
-- Task interruption, pause, resume, cancellation, or cross-run recovery.
-- Human-in-the-loop interaction or approval before tool execution.
-- Tool sandboxing, permission isolation, or other production security controls.
-
-These features can be built around the core loop later, but are kept out of the
-current implementation so that its essential architecture remains easy to
-study.
+`AGENTS.md` instructs the model to keep filesystem work under `./tmp/`, but this
+is a prompt-level policy rather than an OS security boundary. The tools run with
+the same filesystem and process permissions as the harness. Use the project only
+in a controlled environment.
 
 ## Project Structure
 
 ```text
 pi_qwen/
-├── AGENTS.md              # Runtime system instructions for the model
-├── main.py                # CLI configuration and dependency assembly
-├── agent_core/            # Model-independent agent components
-│   ├── __init__.py        # Public agent-core exports
-│   ├── conversation.py    # JSON-backed conversation persistence
-│   ├── loop.py            # Core generate, tool execution, and repeat loop
-│   └── types.py           # Shared messages, interfaces, tools, and results
-├── backends/              # Text-generation backends
-│   ├── __init__.py        # Public backend exports
-│   └── vllm.py            # Raw generation through the vLLM Completions API
-├── protocols/             # Model-family context adapters
-│   ├── __init__.py        # Public protocol exports
-│   └── qwen.py            # Qwen chat-template rendering and output parsing
-│   └── glm.py             # GLM chat-template rendering and output parsing
-├── tools/                 # Tools exposed to the model
-│   ├── __init__.py        # Default tool registry
-│   ├── coding.py          # read, bash, edit, and write tools
-│   └── web_search.py      # DuckDuckGo web search tool
-├── requirements.txt       # Agent-client Python dependencies
-├── README.md              # Project overview and usage
-└── tmp/                   # Git-ignored conversations and raw traces
+├── AGENTS.md               # Runtime instructions supplied to the model
+├── main.py                 # Model configuration, assembly, and interactive CLI
+├── web.py                  # Authentication, conversations, SSE UI, and artifacts
+├── agent_core/             # Model-independent agent components
+│   ├── __init__.py         # Public agent-core exports
+│   ├── conversation.py     # JSON conversation persistence
+│   ├── loop.py             # Generate, parse, execute tools, and repeat
+│   ├── types.py            # Shared protocols, messages, tools, and result types
+│   └── usage.py            # Per-turn and cumulative token-usage persistence
+├── backends/
+│   ├── __init__.py         # Public backend exports
+│   └── vllm.py             # Streaming vLLM Completions API backend
+├── protocols/
+│   ├── __init__.py         # Public protocol exports
+│   ├── qwen.py             # Qwen context rendering and output parsing
+│   └── glm.py              # GLM context rendering and output parsing
+├── tools/
+│   ├── __init__.py         # Default tool registry
+│   ├── coding.py           # read, bash, edit, and write
+│   └── web_search.py       # DuckDuckGo search
+├── requirements.txt        # Python client and Web dependencies
+└── tmp/                    # Git-ignored runtime state and model workspace
 ```
 
-## Supported Model
+The Web application stores data per user and conversation:
 
-The current implementation supports:
+```text
+tmp/
+├── web_users.json
+└── users/<username>/conversations/<timestamp_uuid>/
+    ├── conversation.json
+    ├── metadata.json
+    ├── usage.json
+    ├── trace.txt
+    └── artifacts/
+        ├── downloads/      # User uploads and files downloaded by the model
+        └── outputs/        # Files produced for the user
+```
+
+## Supported Models
 
 - [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)
 - [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)
-- vLLM as the inference backend
+- [vLLM](https://github.com/vllm-project/vllm) as the inference server
 
-Use the official Hugging Face model identifier for both tokenizer loading and
-vLLM deployment:
+Select the active family in `main.py`:
 
 ```python
-MODEL_PATH = "Qwen/Qwen3.8-27B"
-VLLM_MODEL_NAME = "qwen3.8-27b"
-VLLM_BASE_URL = "http://127.0.0.1:8000/v1"
+MODEL_FAMILY = "glm"  # "qwen" or "glm"
 ```
 
-`VLLM_MODEL_NAME` must match the value passed to
-`--served-model-name`.
+Each entry in `MODEL_CONFIGS` defines the tokenizer/checkpoint path, served
+model name, context window, protocol options, and vLLM sampling options. A Hugging
+Face identifier or a local checkpoint path can be used for `model_path`.
+`served_model_name` must match the server's `--served-model-name` value.
 
 ## Tools
 
-- `read`: Read a UTF-8 text file.
-- `bash`: Execute a Bash command.
-- `edit`: Replace one uniquely matching text block in a file.
-- `write`: Create or overwrite a UTF-8 text file.
-- `web_search`: Search the web through DuckDuckGo.
-
-The tools run with the same filesystem and process permissions as `main.py`.
-There is no additional sandbox or approval layer, so run the agent only in a
-controlled environment.
+- `read`: read a UTF-8 text file with an optional line range;
+- `bash`: execute a Bash command and return its exit code and output;
+- `edit`: replace one exact, uniquely matching text block;
+- `write`: create or overwrite a UTF-8 text file;
+- `web_search`: search the Web through DuckDuckGo.
 
 ## Installation
 
-Separate environments are recommended for the vLLM server and agent client.
+Separate environments are recommended for the vLLM server and harness client.
 
-Install the vLLM server:
+Install the client:
+
+```bash
+conda create -n pi_agent python=3.12 -y
+conda activate pi_agent
+git clone https://github.com/WHB139426/pi_qwen.git
+cd pi_qwen
+pip install -r requirements.txt
+```
+
+For a standard vLLM installation suitable for Qwen:
 
 ```bash
 conda create -n vllm python=3.12 -y
@@ -113,22 +131,14 @@ uv pip install -U vllm --pre \
     --index-strategy unsafe-best-match
 ```
 
-Install the agent client:
+The exact vLLM build must be compatible with the host NVIDIA driver and CUDA
+runtime.
+
+## Model Servers on Four H200 GPUs
+
+### Qwen3.8-27B
 
 ```bash
-conda create -n pi_agent python=3.12 -y
-conda activate pi_agent
-git clone <repository-url>
-cd pi_qwen
-pip install -r requirements.txt
-```
-
-## Running on Four H200 GPUs
-
-The model is deployed with tensor parallelism across four NVIDIA H200 GPUs:
-
-```bash
-conda activate vllm
 CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3.8-27B \
     --served-model-name qwen3.8-27b \
     --host 127.0.0.1 \
@@ -139,11 +149,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3.8-27B \
     --gpu-memory-utilization 0.90
 ```
 
-### GLM-5.3-Flash Server
+### GLM-5.3-Flash
 
-GLM-5.3-Flash currently requires its dedicated vLLM Docker image. The following
-command serves local FP8 weights on four H200 GPUs with the native 1M-token
-context window:
+GLM-5.3-Flash uses the dedicated vLLM image below. Replace
+`/path/to/GLM-5.3-Flash` with a local copy of
+[`zai-org/GLM-5.3-Flash`](https://huggingface.co/zai-org/GLM-5.3-Flash).
 
 ```bash
 sudo docker run --rm \
@@ -166,36 +176,73 @@ sudo docker run --rm \
     --no-enable-flashinfer-autotune
 ```
 
-Replace `/path/to/GLM-5.3-Flash` with the local checkpoint directory for
-[`zai-org/GLM-5.3-Flash`](https://huggingface.co/zai-org/GLM-5.3-Flash).
-The server name used by API clients is `glm-5.3-flash`. Stop the foreground
+The API is expected at `http://127.0.0.1:8000/v1`. Stop a foreground server or
 container with `Ctrl+C`.
 
-In another terminal, run the agent:
+## Interactive CLI
+
+After starting the matching vLLM server and selecting `MODEL_FAMILY`:
 
 ```bash
 conda activate pi_agent
-cd pi_qwen
-python main.py \
-    --model Qwen/Qwen3.8-27B \
-    --prompt "Search for today's important AI news and summarize it."
-```
-
-To run the task configured in `main.py`:
-
-```bash
 python main.py
 ```
 
-The final answer is printed to the terminal. The structured conversation and
-complete model trace are written to:
+CLI commands:
 
-```text
-./tmp/conversation.json
-./tmp/trace.txt
+- `/new`: clear the current conversation;
+- `/exit`: leave the CLI.
+
+An optional initial prompt can be supplied while keeping the session interactive:
+
+```bash
+python main.py --prompt "Search for today's important AI news and summarize it."
 ```
 
-The terminal also reports cumulative token usage across all model calls in the
-task: input tokens, output tokens, and their sum. Input usage follows the API
-counting convention, so repeated conversation history is included on every
-agent step.
+The CLI stores its current conversation, usage state, and latest raw trace in:
+
+```text
+tmp/conversation.json
+tmp/conversation_usage.json
+tmp/trace.txt
+```
+
+`RESUME_CONVERSATION` in `main.py` controls whether a new CLI process resumes or
+resets the saved conversation. The terminal reports the latest turn usage,
+cumulative conversation usage, and current context-window occupancy.
+
+## Web Application
+
+Start the Web server after the matching vLLM server is ready:
+
+```bash
+conda activate pi_agent
+python web.py
+```
+
+Open [http://127.0.0.1:8765](http://127.0.0.1:8765), register an account, and
+create a conversation. There is no default account. Registered users persist in
+`tmp/web_users.json`; login sessions are kept only in memory and are cleared when
+`web.py` restarts.
+
+The Web application currently provides:
+
+- multiple users and multiple persistent conversations per user;
+- concurrent execution across different conversations and serialization within
+  one conversation;
+- token-by-token SSE output with separate, collapsible reasoning and tool traces;
+- Markdown rendering for final answers;
+- low, high, and max GLM reasoning controls;
+- per-turn, cumulative conversation, and current-context token statistics;
+- drag-and-drop or file-picker uploads, with a 512 MB limit per file;
+- authenticated artifact downloads and collision-safe filenames;
+- per-conversation `downloads/` and `outputs/` directories.
+
+Successful uploads are appended to `conversation.json` as user-role file events,
+so the model sees the exact filename and path on its next turn without adding a
+dynamic upload inventory to the system prompt. Files generated by the model
+appear in the attachment list after the turn completes.
+
+The server intentionally binds to `127.0.0.1`. Exposing it through a tunnel or
+reverse proxy makes the registration page publicly reachable and should only be
+done in a controlled research environment.
