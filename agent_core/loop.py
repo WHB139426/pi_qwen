@@ -6,7 +6,16 @@ import json
 from pathlib import Path
 
 from .conversation import JsonConversationStore
-from .types import AgentResult, ChatProtocol, Message, TextGenerator, TokenUsage, Tool, UsageState
+from .types import (
+    AgentEventCallback,
+    AgentResult,
+    ChatProtocol,
+    Message,
+    TextGenerator,
+    TokenUsage,
+    Tool,
+    UsageState,
+)
 from .usage import JsonUsageStore
 
 
@@ -22,6 +31,7 @@ class Agent:
         conversation_store: JsonConversationStore | None = None,
         usage_store: JsonUsageStore | None = None,
         trace_path: str | Path | None = None,
+        event_callback: AgentEventCallback | None = None,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
@@ -37,6 +47,7 @@ class Agent:
         self.conversation_store = conversation_store
         self.usage_store = usage_store
         self.trace_path = Path(trace_path) if trace_path is not None else None
+        self.event_callback = event_callback
         self._messages: list[Message] | None = None
         self._usage_state = UsageState()
 
@@ -60,7 +71,13 @@ class Agent:
         for step in range(1, self.max_steps + 1):
             messages = self._load_messages(messages)
             context = self.protocol.render(messages, schemas)
-            generation = self.model.generate(context)
+            self._emit({"type": "generation_start", "step": step})
+            generation = self.model.generate(
+                context,
+                on_delta=lambda delta: self._emit(
+                    {"type": "model_delta", "step": step, "delta": delta}
+                ),
+            )
             raw_output = generation.text
             usage = usage + generation.usage
             conversation_usage = conversation_usage + generation.usage
@@ -73,13 +90,23 @@ class Agent:
             )
             self._write_trace(context, raw_output)
             assistant = self.protocol.parse(raw_output)
+            self._emit(
+                {
+                    "type": "assistant_message",
+                    "step": step,
+                    "content": assistant.get("content", ""),
+                    "reasoning_content": assistant.get("reasoning_content", ""),
+                }
+            )
             messages.append(assistant)
             self._save_messages(messages)
 
             tool_calls = assistant.get("tool_calls")
             if not isinstance(tool_calls, list) or not tool_calls:
+                answer = str(assistant.get("content", ""))
+                self._emit({"type": "final_answer", "step": step, "content": answer})
                 return AgentResult(
-                    answer=str(assistant.get("content", "")),
+                    answer=answer,
                     messages=messages,
                     steps=step,
                     usage=usage,
@@ -88,8 +115,19 @@ class Agent:
                 )
 
             for call in tool_calls:
-                messages.append(self._execute_tool(call))
+                self._emit_tool_call(step, call)
+                tool_result = self._execute_tool(call)
+                messages.append(tool_result)
                 self._save_messages(messages)
+                self._emit(
+                    {
+                        "type": "tool_result",
+                        "step": step,
+                        "tool_call_id": tool_result.get("tool_call_id", ""),
+                        "name": tool_result.get("name", ""),
+                        "content": tool_result.get("content", ""),
+                    }
+                )
 
         raise RuntimeError(f"agent exceeded max_steps={self.max_steps}")
 
@@ -139,6 +177,30 @@ class Agent:
             return
         self.trace_path.parent.mkdir(parents=True, exist_ok=True)
         self.trace_path.write_text(context + raw_output, encoding="utf-8")
+
+    def _emit(self, event: dict[str, object]) -> None:
+        if self.event_callback is None:
+            return
+        try:
+            self.event_callback(event)
+        except Exception:
+            pass
+
+    def _emit_tool_call(self, step: int, call: object) -> None:
+        if not isinstance(call, dict):
+            return
+        function = call.get("function")
+        if not isinstance(function, dict):
+            return
+        self._emit(
+            {
+                "type": "tool_call",
+                "step": step,
+                "tool_call_id": call.get("id", ""),
+                "name": function.get("name", ""),
+                "arguments": function.get("arguments", {}),
+            }
+        )
 
     def _execute_tool(self, call: object) -> Message:
         if not isinstance(call, dict):

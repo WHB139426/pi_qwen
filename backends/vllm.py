@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from agent_core import Generation, TokenUsage
+from agent_core.types import TokenDeltaCallback
 
 
 @dataclass(frozen=True)
@@ -32,25 +33,45 @@ class VLLMBackend:
         self.options = options or VLLMOptions()
         self.client = OpenAI(base_url=base_url, api_key="EMPTY")
 
-    def generate(self, context: str) -> Generation:
+    def generate(
+        self,
+        context: str,
+        *,
+        on_delta: TokenDeltaCallback | None = None,
+    ) -> Generation:
         temperature = self.options.temperature if self.options.do_sample else 0.0
-        response = self.client.completions.create(
+        stream = self.client.completions.create(
             model=self.model,
             prompt=context,
             max_tokens=self.options.max_tokens,
             temperature=temperature,
             top_p=self.options.top_p,
+            stream=True,
+            stream_options={"include_usage": True},
             extra_body={
                 "top_k": self.options.top_k,
                 "skip_special_tokens": False,
             },
         )
-        if response.usage is None:
+        parts: list[str] = []
+        usage = None
+        for chunk in stream:
+            if chunk.usage is not None:
+                usage = chunk.usage
+            for choice in chunk.choices:
+                delta = choice.text
+                if not delta:
+                    continue
+                parts.append(delta)
+                if on_delta is not None:
+                    on_delta(delta)
+
+        if usage is None:
             raise RuntimeError("vLLM response did not include token usage")
         return Generation(
-            text=response.choices[0].text,
+            text="".join(parts),
             usage=TokenUsage(
-                input_tokens=response.usage.prompt_tokens,
-                output_tokens=response.usage.completion_tokens,
+                input_tokens=usage.prompt_tokens,
+                output_tokens=usage.completion_tokens,
             ),
         )

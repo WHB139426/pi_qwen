@@ -388,15 +388,60 @@ def render_history(messages: list[Message]) -> str:
     for message in messages:
         role = message.get("role")
         content = message.get("content")
-        if role not in {"user", "assistant"} or not isinstance(content, str) or not content:
+        if role == "user" and isinstance(content, str) and content:
+            rendered.append(
+                f'<section class="message user" aria-label="You"><pre>{html.escape(content)}</pre></section>'
+            )
             continue
-        body = (
-            f"<pre>{html.escape(content)}</pre>"
-            if role == "user"
-            else f'<div class="markdown-body">{render_markdown(content)}</div>'
-        )
-        label = "You" if role == "user" else "Assistant"
-        rendered.append(f'<section class="message {role}" aria-label="{label}">{body}</section>')
+        if role == "assistant":
+            trace_parts = []
+            reasoning = message.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning:
+                trace_parts.append(
+                    '<details class="trace-entry">'
+                    '<summary>Reasoning</summary>'
+                    f'<pre>{html.escape(reasoning)}</pre>'
+                    '</details>'
+                )
+            tool_calls = message.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for call in tool_calls:
+                    if not isinstance(call, dict):
+                        continue
+                    function = call.get("function")
+                    if not isinstance(function, dict):
+                        continue
+                    name = html.escape(str(function.get("name", "tool")))
+                    arguments = html.escape(
+                        json.dumps(function.get("arguments", {}), ensure_ascii=False, indent=2)
+                    )
+                    trace_parts.append(
+                        '<details class="trace-entry">'
+                        f'<summary>Tool call · {name}</summary>'
+                        f'<pre>{arguments}</pre>'
+                        '</details>'
+                    )
+            answer = (
+                f'<div class="markdown-body">{render_markdown(content)}</div>'
+                if isinstance(content, str) and content
+                else ""
+            )
+            if trace_parts or answer:
+                trace = f'<div class="trace-stack">{"".join(trace_parts)}</div>' if trace_parts else ""
+                rendered.append(
+                    f'<section class="message assistant" aria-label="Assistant">{trace}{answer}</section>'
+                )
+            continue
+        if role == "tool" and isinstance(content, str):
+            name = html.escape(str(message.get("name", "tool")))
+            rendered.append(
+                '<section class="message tool-message" aria-label="Tool result">'
+                '<details class="trace-entry">'
+                f'<summary>Tool result · {name}</summary>'
+                f'<pre>{html.escape(content)}</pre>'
+                '</details>'
+                '</section>'
+            )
     if not rendered:
         return '<p class="empty">No messages yet.</p>'
     return "".join(rendered)
@@ -645,6 +690,12 @@ button, select {{ color: inherit; }}
 .message > pre {{ margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-family: inherit; line-height: 1.55; }}
 .user {{ width: fit-content; max-width: min(78%, 720px); margin-left: auto; padding: 0.72rem 1rem; border-radius: 1.25rem; color: #fff; background: #24579b; }}
 .assistant {{ padding: 0.45rem 0.25rem 1rem; }}
+.tool-message {{ padding: 0 0.25rem 0.7rem; }}
+.trace-stack {{ display: grid; gap: 0.42rem; margin: 0 0 0.8rem; }}
+.trace-entry {{ border: 1px solid #303030; border-radius: 0.65rem; color: #929292; background-color: #171717; background-image: repeating-linear-gradient(135deg, rgba(255, 255, 255, 0.018) 0, rgba(255, 255, 255, 0.018) 1px, transparent 1px, transparent 7px); font-size: 0.8rem; }}
+.trace-entry summary {{ padding: 0.48rem 0.65rem; cursor: pointer; color: #9d9d9d; user-select: none; }}
+.trace-entry[open] summary {{ border-bottom: 1px solid #2b2b2b; }}
+.trace-entry pre {{ max-height: 14rem; margin: 0; padding: 0.65rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: #858585; font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.76rem; line-height: 1.5; }}
 .markdown-body {{ line-height: 1.65; }}
 .markdown-body > :first-child {{ margin-top: 0; }}
 .markdown-body > :last-child {{ margin-bottom: 0; }}
@@ -678,8 +729,14 @@ button, select {{ color: inherit; }}
 .error {{ margin-bottom: 1rem; padding: 0.9rem; border: 1px solid #713939; border-radius: 0.8rem; color: #ffb4b4; background: #2a1717; }}
 .error h2 {{ margin-top: 0; font-size: 1rem; }}
 .error pre {{ margin-bottom: 0; white-space: pre-wrap; }}
-.thinking {{ display: flex; width: fit-content; align-items: center; justify-content: center; gap: 0.65rem; margin: 0 auto 0.8rem; padding: 0.65rem 1rem; border: 1px solid #3a3a3a; border-radius: 999px; color: #ddd; background: #1c1c1c; box-shadow: 0 10px 32px rgba(0, 0, 0, 0.35); }}
-.thinking[hidden] {{ display: none; }}
+.activity-panel {{ margin: 0 0 0.8rem; border: 1px solid #303030; border-radius: 0.85rem; color: #999; background-color: #161616; background-image: repeating-linear-gradient(135deg, rgba(255, 255, 255, 0.02) 0, rgba(255, 255, 255, 0.02) 1px, transparent 1px, transparent 8px); box-shadow: 0 10px 32px rgba(0, 0, 0, 0.22); font-size: 0.82rem; }}
+.activity-panel[hidden] {{ display: none; }}
+.activity-panel > details > summary {{ display: flex; align-items: center; gap: 0.6rem; padding: 0.65rem 0.8rem; cursor: pointer; color: #b0b0b0; user-select: none; }}
+.activity-events {{ display: grid; gap: 0.5rem; max-height: 19rem; padding: 0 0.65rem 0.65rem; overflow-y: auto; }}
+.live-step {{ display: grid; gap: 0.45rem; }}
+.live-reasoning {{ margin: 0; }}
+.live-tool-status {{ padding: 0.45rem 0.65rem; color: #777; border-top: 1px solid #292929; }}
+.activity-error {{ padding: 0.65rem; border: 1px solid #713939; border-radius: 0.6rem; color: #ffb4b4; background: #2a1717; white-space: pre-wrap; }}
 .spinner {{
     width: 1.1rem;
     height: 1.1rem;
@@ -714,10 +771,12 @@ button, select {{ color: inherit; }}
 <header class="brand"><h1>Haibo's GLM-5.3-Flash</h1></header>
 <div class="history">{history_html}</div>
 {error_section}
-<div id="thinking" class="thinking" role="status" aria-live="polite" hidden>
-<span class="spinner" aria-hidden="true"></span>
-<span>Model is thinking...</span>
-</div>
+<section id="thinking" class="activity-panel" role="status" aria-live="polite" hidden>
+<details open>
+<summary><span class="spinner" aria-hidden="true"></span><span id="activity-status">Model is thinking...</span></summary>
+<div id="activity-events" class="activity-events"></div>
+</details>
+</section>
 <form id="run-form" class="composer" method="post" action="/chat/{conversation_id}/run">
 <textarea id="prompt" name="prompt" rows="1" placeholder="Ask anything, or task an agent..." required>{prompt_html}</textarea>
 <div class="composer-footer">
@@ -745,11 +804,15 @@ const newButton = document.getElementById("new-button");
 const reasoningEffort = document.getElementById("reasoning-effort");
 const effortValue = document.getElementById("effort-value");
 const thinking = document.getElementById("thinking");
+const activityStatus = document.getElementById("activity-status");
+const activityEvents = document.getElementById("activity-events");
 const sidebar = document.getElementById("sidebar");
 const sidebarToggle = document.getElementById("sidebar-toggle");
 const sidebarClose = document.getElementById("sidebar-close");
 const sidebarBackdrop = document.getElementById("sidebar-backdrop");
 const deleteForms = document.querySelectorAll(".delete-form");
+const liveSteps = new Map();
+const liveTools = new Map();
 
 function resizePrompt() {{
     promptInput.style.height = "auto";
@@ -780,20 +843,175 @@ deleteForms.forEach((form) => {{
     }});
 }});
 
-runForm.addEventListener("submit", () => {{
+function setRunning(running) {{
     promptInput.readOnly = true;
-    sendButton.disabled = true;
-    newButton.disabled = true;
-    deleteForms.forEach((form) => {{ form.querySelector("button").disabled = true; }});
+    if (!running) {{ promptInput.readOnly = false; }}
+    sendButton.disabled = running;
+    newButton.disabled = running;
+    deleteForms.forEach((form) => {{ form.querySelector("button").disabled = running; }});
+    thinking.hidden = !running;
+}}
+
+function ensureLiveStep(stepNumber) {{
+    if (liveSteps.has(stepNumber)) {{ return liveSteps.get(stepNumber); }}
+    const step = document.createElement("div");
+    step.className = "live-step";
+
+    const reasoning = document.createElement("details");
+    reasoning.className = "trace-entry live-reasoning";
+    reasoning.open = true;
+    const summary = document.createElement("summary");
+    summary.textContent = `Reasoning · Turn ${{stepNumber}}`;
+    const pre = document.createElement("pre");
+    pre.textContent = "Waiting for model output...";
+    reasoning.append(summary, pre);
+
+    const tools = document.createElement("div");
+    tools.className = "trace-stack";
+    step.append(reasoning, tools);
+    activityEvents.append(step);
+
+    const state = {{ raw: "", reasoning: pre, tools }};
+    liveSteps.set(stepNumber, state);
+    return state;
+}}
+
+function streamedReasoning(raw) {{
+    const start = raw.indexOf("<think>");
+    const reasoningStart = start >= 0 ? start + "<think>".length : 0;
+    const end = raw.indexOf("</think>", reasoningStart);
+    return raw.slice(reasoningStart, end >= 0 ? end : raw.length).trimStart();
+}}
+
+function addToolCall(event) {{
+    const step = ensureLiveStep(event.step);
+    const details = document.createElement("details");
+    details.className = "trace-entry";
+    details.open = true;
+    const summary = document.createElement("summary");
+    summary.textContent = `Tool call · ${{event.name || "tool"}}`;
+    const argumentsBlock = document.createElement("pre");
+    argumentsBlock.textContent = JSON.stringify(event.arguments || {{}}, null, 2);
+    const status = document.createElement("div");
+    status.className = "live-tool-status";
+    status.textContent = "Running...";
+    details.append(summary, argumentsBlock, status);
+    step.tools.append(details);
+    liveTools.set(event.tool_call_id, {{ details, status }});
+}}
+
+function addToolResult(event) {{
+    let tool = liveTools.get(event.tool_call_id);
+    if (!tool) {{
+        addToolCall(event);
+        tool = liveTools.get(event.tool_call_id);
+    }}
+    tool.status.textContent = "Completed";
+    const result = document.createElement("pre");
+    result.textContent = String(event.content || "");
+    tool.details.append(result);
+}}
+
+function showStreamError(message) {{
+    activityStatus.textContent = "Agent stopped";
+    const error = document.createElement("div");
+    error.className = "activity-error";
+    error.textContent = message;
+    activityEvents.append(error);
+    setRunning(false);
     thinking.hidden = false;
+}}
+
+function handleAgentEvent(event) {{
+    if (event.type === "stream_start") {{
+        activityStatus.textContent = "Model is thinking...";
+        return;
+    }}
+    if (event.type === "generation_start") {{
+        activityStatus.textContent = `Model is thinking · Turn ${{event.step}}`;
+        ensureLiveStep(event.step);
+        return;
+    }}
+    if (event.type === "model_delta") {{
+        const step = ensureLiveStep(event.step);
+        step.raw += event.delta || "";
+        step.reasoning.textContent = streamedReasoning(step.raw) || "Waiting for reasoning...";
+        activityEvents.scrollTop = activityEvents.scrollHeight;
+        return;
+    }}
+    if (event.type === "assistant_message") {{
+        const step = ensureLiveStep(event.step);
+        step.reasoning.textContent = event.reasoning_content || "No reasoning content returned.";
+        return;
+    }}
+    if (event.type === "tool_call") {{
+        activityStatus.textContent = `Running tool · ${{event.name || "tool"}}`;
+        addToolCall(event);
+        activityEvents.scrollTop = activityEvents.scrollHeight;
+        return;
+    }}
+    if (event.type === "tool_result") {{
+        addToolResult(event);
+        activityStatus.textContent = "Tool completed; model is continuing...";
+        activityEvents.scrollTop = activityEvents.scrollHeight;
+        return;
+    }}
+    if (event.type === "final_answer") {{
+        activityStatus.textContent = "Preparing final answer...";
+        return;
+    }}
+    if (event.type === "error") {{
+        showStreamError(event.message || "Unknown agent error");
+        return;
+    }}
+    if (event.type === "done") {{
+        window.location.assign(event.redirect);
+    }}
+}}
+
+async function runAgentStream() {{
+    const response = await fetch(runForm.action, {{
+        method: "POST",
+        body: new URLSearchParams(new FormData(runForm)),
+        headers: {{ "Accept": "text/event-stream" }},
+    }});
+    if (!response.ok || !response.body) {{
+        throw new Error(`Request failed with status ${{response.status}}`);
+    }}
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {{
+        const {{ value, done }} = await reader.read();
+        buffer += decoder.decode(value || new Uint8Array(), {{ stream: !done }});
+        const frames = buffer.split("\\n\\n");
+        buffer = frames.pop() || "";
+        for (const frame of frames) {{
+            const data = frame.split("\\n")
+                .filter((line) => line.startsWith("data:"))
+                .map((line) => line.slice(5).trimStart())
+                .join("\\n");
+            if (data) {{ handleAgentEvent(JSON.parse(data)); }}
+        }}
+        if (done) {{ break; }}
+    }}
+}}
+
+runForm.addEventListener("submit", (event) => {{
+    event.preventDefault();
+    activityEvents.replaceChildren();
+    liveSteps.clear();
+    liveTools.clear();
+    setRunning(true);
+    runAgentStream().catch((error) => showStreamError(error.message));
 }});
 
 window.addEventListener("pageshow", () => {{
-    promptInput.readOnly = false;
-    sendButton.disabled = false;
-    newButton.disabled = false;
-    deleteForms.forEach((form) => {{ form.querySelector("button").disabled = false; }});
-    thinking.hidden = true;
+    setRunning(false);
+    activityEvents.replaceChildren();
+    liveSteps.clear();
+    liveTools.clear();
     resizePrompt();
     syncEffortLabel();
 }});
@@ -960,20 +1178,22 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        try:
-            conversation_path, usage_path, trace_path, _ = conversation_paths(
+        if "text/event-stream" in self.headers.get("Accept", ""):
+            self._stream_agent_run(
                 username,
                 conversation_id,
+                prompt,
+                reasoning_effort,
             )
-            with conversation_lock(username, conversation_id):
-                agent = create_agent(
-                    conversation_path=conversation_path,
-                    usage_path=usage_path,
-                    trace_path=trace_path,
-                    reasoning_effort=reasoning_effort,
-                )
-                agent.run(prompt)
-                update_conversation_metadata(username, conversation_id, prompt)
+            return
+
+        try:
+            self._run_agent(
+                username,
+                conversation_id,
+                prompt,
+                reasoning_effort,
+            )
             self._redirect_conversation(conversation_id, reasoning_effort)
         except Exception as exc:
             traceback.print_exc()
@@ -987,6 +1207,76 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                     reasoning_effort=reasoning_effort,
                 ),
             )
+
+    def _run_agent(
+        self,
+        username: str,
+        conversation_id: str,
+        prompt: str,
+        reasoning_effort: str,
+        *,
+        event_callback=None,
+    ) -> None:
+        conversation_path, usage_path, trace_path, _ = conversation_paths(
+            username,
+            conversation_id,
+        )
+        with conversation_lock(username, conversation_id):
+            agent = create_agent(
+                conversation_path=conversation_path,
+                usage_path=usage_path,
+                trace_path=trace_path,
+                reasoning_effort=reasoning_effort,
+                event_callback=event_callback,
+            )
+            agent.run(prompt)
+            update_conversation_metadata(username, conversation_id, prompt)
+
+    def _stream_agent_run(
+        self,
+        username: str,
+        conversation_id: str,
+        prompt: str,
+        reasoning_effort: str,
+    ) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+
+        connected = True
+
+        def send_event(event: dict[str, object]) -> None:
+            nonlocal connected
+            if not connected:
+                return
+            try:
+                payload = json.dumps(event, ensure_ascii=False, default=str)
+                self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                connected = False
+
+        try:
+            send_event({"type": "stream_start"})
+            self._run_agent(
+                username,
+                conversation_id,
+                prompt,
+                reasoning_effort,
+                event_callback=send_event,
+            )
+            send_event(
+                {
+                    "type": "done",
+                    "redirect": f"/chat/{conversation_id}?reasoning_effort={reasoning_effort}",
+                }
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            send_event({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
 
     def _new_conversation(self, username: str) -> None:
         self._redirect_conversation(

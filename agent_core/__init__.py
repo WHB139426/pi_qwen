@@ -2,12 +2,24 @@
 
 from .conversation import JsonConversationStore
 from .loop import Agent
-from .types import AgentResult, ChatProtocol, Generation, Message, TextGenerator, TokenUsage, Tool, UsageState
+from .types import (
+    AgentEventCallback,
+    AgentResult,
+    ChatProtocol,
+    Generation,
+    Message,
+    TextGenerator,
+    TokenDeltaCallback,
+    TokenUsage,
+    Tool,
+    UsageState,
+)
 from .usage import JsonUsageStore
 
 
 __all__ = [
     "Agent",
+    "AgentEventCallback",
     "AgentResult",
     "ChatProtocol",
     "Generation",
@@ -15,6 +27,7 @@ __all__ = [
     "JsonUsageStore",
     "Message",
     "TextGenerator",
+    "TokenDeltaCallback",
     "TokenUsage",
     "Tool",
     "UsageState",

@@ -7,10 +7,17 @@ from typing import Callable, Protocol
 
 
 Message = dict[str, object]
+TokenDeltaCallback = Callable[[str], None]
+AgentEventCallback = Callable[[dict[str, object]], None]
 
 
 class TextGenerator(Protocol):
-    def generate(self, context: str) -> Generation:
+    def generate(
+        self,
+        context: str,
+        *,
+        on_delta: TokenDeltaCallback | None = None,
+    ) -> Generation:
         """Generate raw text and usage from a fully constructed context."""
 
 

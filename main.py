@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Callable
 
 from agent_core import Agent, AgentResult, JsonConversationStore, JsonUsageStore
 from backends import VLLMBackend, VLLMOptions
@@ -117,6 +118,7 @@ def create_agent(
     usage_path: str | Path | None = None,
     trace_path: str | Path = TRACE_PATH,
     reasoning_effort: str | None = None,
+    event_callback: Callable[[dict[str, object]], None] | None = None,
 ) -> Agent:
     conversation_path = Path(conversation_path)
     if usage_path is None:
@@ -142,6 +144,7 @@ def create_agent(
         conversation_store=JsonConversationStore(conversation_path),
         usage_store=JsonUsageStore(usage_path),
         trace_path=trace_path,
+        event_callback=event_callback,
     )
 
 
