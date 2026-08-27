@@ -2,7 +2,8 @@
 
 from .conversation import JsonConversationStore
 from .loop import Agent
-from .types import AgentResult, ChatProtocol, Generation, Message, TextGenerator, TokenUsage, Tool
+from .types import AgentResult, ChatProtocol, Generation, Message, TextGenerator, TokenUsage, Tool, UsageState
+from .usage import JsonUsageStore
 
 
 __all__ = [
@@ -11,8 +12,10 @@ __all__ = [
     "ChatProtocol",
     "Generation",
     "JsonConversationStore",
+    "JsonUsageStore",
     "Message",
     "TextGenerator",
     "TokenUsage",
     "Tool",
+    "UsageState",
 ]

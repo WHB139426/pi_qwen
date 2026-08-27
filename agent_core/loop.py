@@ -6,7 +6,8 @@ import json
 from pathlib import Path
 
 from .conversation import JsonConversationStore
-from .types import AgentResult, ChatProtocol, Message, TextGenerator, TokenUsage, Tool
+from .types import AgentResult, ChatProtocol, Message, TextGenerator, TokenUsage, Tool, UsageState
+from .usage import JsonUsageStore
 
 
 class Agent:
@@ -19,6 +20,7 @@ class Agent:
         system_prompt: str = "You are a helpful agent. Use tools when needed, and continue until the task is complete.",
         max_steps: int = 8,
         conversation_store: JsonConversationStore | None = None,
+        usage_store: JsonUsageStore | None = None,
         trace_path: str | Path | None = None,
     ) -> None:
         if max_steps < 1:
@@ -33,17 +35,27 @@ class Agent:
         self.system_prompt = system_prompt
         self.max_steps = max_steps
         self.conversation_store = conversation_store
+        self.usage_store = usage_store
         self.trace_path = Path(trace_path) if trace_path is not None else None
+        self._messages: list[Message] | None = None
+        self._usage_state = UsageState()
 
     def run(self, prompt: str) -> AgentResult:
-        messages: list[Message] = []
-        if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
+        messages = self._load_or_initialize_messages()
         messages.append({"role": "user", "content": prompt})
         self._save_messages(messages)
 
         schemas = [tool.schema() for tool in self.tools.values()]
         usage = TokenUsage()
+        previous_usage_state = self._load_usage_state()
+        conversation_usage = previous_usage_state.conversation
+        self._save_usage_state(
+            UsageState(
+                turn=usage,
+                conversation=conversation_usage,
+                current_context_tokens=previous_usage_state.current_context_tokens,
+            )
+        )
 
         for step in range(1, self.max_steps + 1):
             messages = self._load_messages(messages)
@@ -51,6 +63,14 @@ class Agent:
             generation = self.model.generate(context)
             raw_output = generation.text
             usage = usage + generation.usage
+            conversation_usage = conversation_usage + generation.usage
+            self._save_usage_state(
+                UsageState(
+                    turn=usage,
+                    conversation=conversation_usage,
+                    current_context_tokens=generation.usage.total_tokens,
+                )
+            )
             self._write_trace(context, raw_output)
             assistant = self.protocol.parse(raw_output)
             messages.append(assistant)
@@ -63,6 +83,7 @@ class Agent:
                     messages=messages,
                     steps=step,
                     usage=usage,
+                    conversation_usage=conversation_usage,
                     current_context_tokens=generation.usage.total_tokens,
                 )
 
@@ -72,14 +93,46 @@ class Agent:
 
         raise RuntimeError(f"agent exceeded max_steps={self.max_steps}")
 
+    def reset(self) -> None:
+        if self.conversation_store is not None:
+            self.conversation_store.clear()
+        if self.usage_store is not None:
+            self.usage_store.clear()
+        self._save_messages(self._initial_messages())
+        self._save_usage_state(UsageState())
+
+    def _load_or_initialize_messages(self) -> list[Message]:
+        if self.conversation_store is not None and self.conversation_store.exists():
+            return self.conversation_store.load()
+        if self._messages is not None:
+            return self._messages
+        return self._initial_messages()
+
+    def _initial_messages(self) -> list[Message]:
+        if not self.system_prompt:
+            return []
+        return [{"role": "system", "content": self.system_prompt}]
+
     def _load_messages(self, in_memory_messages: list[Message]) -> list[Message]:
         if self.conversation_store is None:
             return in_memory_messages
         return self.conversation_store.load()
 
     def _save_messages(self, messages: list[Message]) -> None:
-        if self.conversation_store is not None:
-            self.conversation_store.save(messages)
+        self._messages = messages
+        if self.conversation_store is None:
+            return
+        self.conversation_store.save(messages)
+
+    def _load_usage_state(self) -> UsageState:
+        if self.usage_store is not None and self.usage_store.exists():
+            return self.usage_store.load()
+        return self._usage_state
+
+    def _save_usage_state(self, state: UsageState) -> None:
+        self._usage_state = state
+        if self.usage_store is not None:
+            self.usage_store.save(state)
 
     def _write_trace(self, context: str, raw_output: str) -> None:
         if self.trace_path is None:

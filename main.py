@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from agent_core import Agent, JsonConversationStore
+from agent_core import Agent, AgentResult, JsonConversationStore, JsonUsageStore
 from backends import VLLMBackend, VLLMOptions
 from protocols import GLMProtocol, QwenProtocol
 from tools import TOOLS
@@ -98,6 +98,7 @@ VLLM_BASE_URL = MODEL_CONFIG["vllm_base_url"]
 
 CONVERSATION_PATH = Path("./tmp/conversation.json")
 TRACE_PATH = Path("./tmp/trace.txt")
+RESUME_CONVERSATION = False
 
 PROMPT = "9月初从上海出发，意大利入，法国出。情侣两人，帮我规划意大利，瑞士，法国的十二日行程，节奏不要太赶，喜欢拍照出片，体验当地人文特色，预算总共4w以内，推荐酒店以及特色美食，但是不要吃太奇怪的食物，考虑天气因素，给我一份具体规划路线，最后计划写成一个.md在./tmp目录下. 在写计划的时候，记得标注新闻、报道、信息以及数据这些东西的来源"
 # PROMPT = "解读英伟达最新财报，并由此分析九月份AI相关产业的股价走势，结合历史上的数据，给出你认为比较适合投资的公司，最后计划写成一个.md在 ./tmp目录下。在写计划的时候，记得标注新闻、报道、信息以及数据这些东西的来源"
@@ -113,11 +114,19 @@ def create_agent(
     model_path: str = MODEL_PATH,
     max_steps: int = 100,
     conversation_path: str | Path = CONVERSATION_PATH,
+    usage_path: str | Path | None = None,
     trace_path: str | Path = TRACE_PATH,
+    reasoning_effort: str | None = None,
 ) -> Agent:
+    conversation_path = Path(conversation_path)
+    if usage_path is None:
+        usage_path = conversation_path.with_name(f"{conversation_path.stem}_usage.json")
+    protocol_options = dict(MODEL_CONFIG["protocol_options"])
+    if reasoning_effort is not None:
+        protocol_options["reasoning_effort"] = reasoning_effort
     protocol = MODEL_CONFIG["protocol"](
         model_path,
-        **MODEL_CONFIG["protocol_options"],
+        **protocol_options,
     )
     model = VLLMBackend(
         VLLM_MODEL_NAME,
@@ -131,13 +140,14 @@ def create_agent(
         system_prompt=load_agent_instructions(),
         max_steps=max_steps,
         conversation_store=JsonConversationStore(conversation_path),
+        usage_store=JsonUsageStore(usage_path),
         trace_path=trace_path,
     )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run one non-interactive agent task.")
-    parser.add_argument("--prompt", default=PROMPT)
+    parser = argparse.ArgumentParser(description="Run a local multi-turn agent conversation.")
+    parser.add_argument("--prompt", default=None, help="Optional first user message.")
     parser.add_argument("--model", default=MODEL_PATH)
     parser.add_argument("--max-steps", type=int, default=100)
     args = parser.parse_args()
@@ -147,17 +157,49 @@ def main() -> None:
         max_steps=args.max_steps,
     )
 
-    result = agent.run(args.prompt)
+    if not RESUME_CONVERSATION:
+        agent.reset()
 
+    pending_prompt = args.prompt
+    print("Local agent chat. Commands: /new, /exit")
+
+    while True:
+        try:
+            prompt = pending_prompt if pending_prompt is not None else input("\nYou: ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        pending_prompt = None
+        prompt = prompt.strip()
+
+        if not prompt:
+            continue
+        if prompt == "/exit":
+            break
+        if prompt == "/new":
+            agent.reset()
+            print("Started a new conversation.")
+            continue
+
+        result = agent.run(prompt)
+        print_result(result)
+
+
+def print_result(result: AgentResult) -> None:
     print('=' * 24, 'Final Answer', '=' * 24)
     print(result.answer)
-    print('=' * 24, 'Token Usage', '=' * 25)
+    print('=' * 25, 'Turn Usage', '=' * 25)
     print(f"Input tokens:  {result.usage.input_tokens:,}")
     print(f"Output tokens: {result.usage.output_tokens:,}")
     print(f"Total tokens:  {result.usage.total_tokens:,}")
-    context_usage = result.current_context_tokens / CONTEXT_WINDOW * 100
+    print('=' * 21, 'Conversation Usage', '=' * 21)
+    print(f"Input tokens:  {result.conversation_usage.input_tokens:,}")
+    print(f"Output tokens: {result.conversation_usage.output_tokens:,}")
+    print(f"Total tokens:  {result.conversation_usage.total_tokens:,}")
+    context_tokens = result.current_context_tokens
+    context_usage = context_tokens / CONTEXT_WINDOW * 100
     print('=' * 22, 'Current Context', '=' * 22)
-    print(f"{result.current_context_tokens:,}/{CONTEXT_WINDOW:,} ({context_usage:.2f}%)")
+    print(f"{context_tokens:,}/{CONTEXT_WINDOW:,} ({context_usage:.2f}%)")
 
 
 if __name__ == "__main__":

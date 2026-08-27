@@ -14,6 +14,9 @@ class JsonConversationStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
 
+    def exists(self) -> bool:
+        return self.path.is_file()
+
     def load(self) -> list[Message]:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -34,3 +37,6 @@ class JsonConversationStore:
             encoding="utf-8",
         )
         temporary_path.replace(self.path)
+
+    def clear(self) -> None:
+        self.path.unlink(missing_ok=True)

@@ -61,6 +61,13 @@ class TokenUsage:
 
 
 @dataclass(frozen=True)
+class UsageState:
+    turn: TokenUsage = TokenUsage()
+    conversation: TokenUsage = TokenUsage()
+    current_context_tokens: int = 0
+
+
+@dataclass(frozen=True)
 class Generation:
     text: str
     usage: TokenUsage
@@ -72,4 +79,5 @@ class AgentResult:
     messages: list[Message]
     steps: int
     usage: TokenUsage
+    conversation_usage: TokenUsage
     current_context_tokens: int
