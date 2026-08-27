@@ -22,7 +22,7 @@ from uuid import UUID, uuid4
 import bleach
 import markdown
 
-from agent_core import JsonConversationStore, JsonUsageStore, Message, UsageState
+from agent_core import AgentResult, JsonConversationStore, JsonUsageStore, Message, UsageState
 from main import CONTEXT_WINDOW, create_agent
 
 
@@ -710,7 +710,7 @@ button, select {{ color: inherit; }}
 .thinking-line {{ display: flex; align-items: center; gap: 0.55rem; padding: 0.4rem 0.25rem 0.6rem; color: #9a9a9a; font-size: 0.9rem; }}
 .thinking-label {{ color: #9a9a9a; }}
 .thinking-dots {{ display: inline-flex; gap: 0.28rem; }}
-.thinking-dots span {{ width: 0.42rem; height: 0.42rem; border-radius: 50%; background: #7aa2e3; animation: thinking-bounce 1.2s ease-in-out infinite; }}
+.thinking-dots span {{ width: 0.42rem; height: 0.42rem; border-radius: 50%; background: #7aa2e3; animation: thinking-bounce 1.2s ease-in-out infinite; will-change: transform, opacity; }}
 .thinking-dots span:nth-child(2) {{ animation-delay: 0.18s; }}
 .thinking-dots span:nth-child(3) {{ animation-delay: 0.36s; }}
 @keyframes thinking-bounce {{ 0%, 80%, 100% {{ transform: scale(0.5); opacity: 0.35; }} 40% {{ transform: scale(1); opacity: 1; }} }}
@@ -798,7 +798,9 @@ const deleteForms = document.querySelectorAll(".delete-form");
 const history = document.querySelector(".history");
 const liveSteps = new Map();
 const liveTools = new Map();
+const pendingModelSteps = new Set();
 let thinkingLine = null;
+let modelRenderFrame = null;
 
 function resizePrompt() {{
     promptInput.style.height = "auto";
@@ -842,8 +844,12 @@ function showThinking(label) {{
         thinkingLine.className = "thinking-line";
         thinkingLine.innerHTML = '<span class="thinking-dots" aria-hidden="true"><span></span><span></span><span></span></span><span class="thinking-label"></span>';
     }}
-    thinkingLine.querySelector(".thinking-label").textContent = label || "Thinking";
-    history.append(thinkingLine);
+    const nextLabel = label || "Thinking";
+    const labelElement = thinkingLine.querySelector(".thinking-label");
+    if (labelElement.textContent !== nextLabel) {{ labelElement.textContent = nextLabel; }}
+    if (thinkingLine.parentElement !== history || history.lastElementChild !== thinkingLine) {{
+        history.append(thinkingLine);
+    }}
     maybeScroll();
 }}
 
@@ -873,13 +879,23 @@ function ensureLiveTurn(stepNumber) {{
     section.append(trace);
     history.append(section);
 
-    const state = {{ raw: "", section, trace, reasoning, reasoningPre, contentEl: null }};
+    const state = {{
+        raw: "",
+        renderedReasoning: "",
+        renderedContent: "",
+        section,
+        trace,
+        reasoning,
+        reasoningPre,
+        contentEl: null,
+    }};
     liveSteps.set(stepNumber, state);
     return state;
 }}
 
 function updateReasoning(state, text) {{
-    if (!text) {{ return; }}
+    if (!text || text === state.renderedReasoning) {{ return; }}
+    state.renderedReasoning = text;
     state.reasoning.hidden = false;
     state.reasoningPre.textContent = text;
 }}
@@ -894,8 +910,40 @@ function ensureContentEl(state) {{
 }}
 
 function setContent(state, text) {{
-    if (!text) {{ return; }}
+    if (!text || text === state.renderedContent) {{ return; }}
+    state.renderedContent = text;
     ensureContentEl(state).textContent = text;
+}}
+
+function finalizeContent(state, renderedHtml) {{
+    if (!renderedHtml) {{ return; }}
+    const content = document.createElement("div");
+    content.className = "markdown-body";
+    content.innerHTML = renderedHtml;
+    if (state.contentEl) {{
+        state.contentEl.replaceWith(content);
+    }} else {{
+        state.section.append(content);
+    }}
+    state.contentEl = content;
+}}
+
+function updateUsage(renderedHtml) {{
+    if (!renderedHtml) {{ return; }}
+    const current = document.querySelector(".usage");
+    if (!current) {{ return; }}
+    const template = document.createElement("template");
+    template.innerHTML = renderedHtml.trim();
+    const replacement = template.content.firstElementChild;
+    if (replacement) {{ current.replaceWith(replacement); }}
+}}
+
+function updateConversationTitle(title) {{
+    if (!title) {{ return; }}
+    const activeLink = document.querySelector(".conversation-item.active .conversation-link");
+    if (!activeLink) {{ return; }}
+    activeLink.textContent = title;
+    activeLink.title = title;
 }}
 
 function streamedReasoning(raw) {{
@@ -912,6 +960,38 @@ function streamedContent(raw) {{
     content = content.replace(/<tool_call\\b[\\s\\S]*?<\\/tool_call>/g, "");
     content = content.replace(/<tool_call\\b[\\s\\S]*$/, "");
     return content.trim();
+}}
+
+function flushModelRenders() {{
+    modelRenderFrame = null;
+    let isWriting = false;
+    for (const step of pendingModelSteps) {{
+        const state = liveSteps.get(step);
+        if (!state) {{ continue; }}
+        updateReasoning(state, streamedReasoning(state.raw));
+        const content = streamedContent(state.raw);
+        if (content) {{
+            setContent(state, content);
+            isWriting = true;
+        }}
+    }}
+    pendingModelSteps.clear();
+    showThinking(isWriting ? "Writing" : "Thinking");
+}}
+
+function scheduleModelRender(step) {{
+    pendingModelSteps.add(step);
+    if (modelRenderFrame === null) {{
+        modelRenderFrame = window.requestAnimationFrame(flushModelRenders);
+    }}
+}}
+
+function cancelPendingModelRenders() {{
+    pendingModelSteps.clear();
+    if (modelRenderFrame !== null) {{
+        window.cancelAnimationFrame(modelRenderFrame);
+        modelRenderFrame = null;
+    }}
 }}
 
 function maybeScroll() {{
@@ -933,6 +1013,7 @@ function appendUserMessage(text) {{
     pre.textContent = text;
     section.append(pre);
     history.append(section);
+    return section;
 }}
 
 function addToolCall(event) {{
@@ -986,18 +1067,11 @@ function handleAgentEvent(event) {{
     if (event.type === "model_delta") {{
         const state = ensureLiveTurn(event.step);
         state.raw += event.delta || "";
-        updateReasoning(state, streamedReasoning(state.raw));
-        const content = streamedContent(state.raw);
-        if (content) {{
-            setContent(state, content);
-            showThinking("Writing");
-        }} else {{
-            showThinking("Thinking");
-        }}
-        maybeScroll();
+        scheduleModelRender(event.step);
         return;
     }}
     if (event.type === "assistant_message") {{
+        cancelPendingModelRenders();
         const state = ensureLiveTurn(event.step);
         updateReasoning(state, event.reasoning_content || "");
         setContent(state, event.content || "");
@@ -1026,7 +1100,14 @@ function handleAgentEvent(event) {{
         return;
     }}
     if (event.type === "done") {{
-        window.location.assign(event.redirect);
+        cancelPendingModelRenders();
+        const state = liveSteps.get(event.final_step);
+        if (state) {{ finalizeContent(state, event.answer_html || ""); }}
+        updateUsage(event.usage_html || "");
+        updateConversationTitle(event.conversation_title || "");
+        hideThinking();
+        setRunning(false);
+        maybeScroll();
     }}
 }}
 
@@ -1071,11 +1152,12 @@ runForm.addEventListener("submit", (event) => {{
     const promptText = promptInput.value;
     if (!promptText.trim()) {{ return; }}
     const body = new URLSearchParams(new FormData(runForm));
-    appendUserMessage(promptText);
+    const pendingUserMessage = appendUserMessage(promptText);
     document.body.classList.remove("landing-page");
     document.body.classList.add("chat-page");
     promptInput.value = "";
     resizePrompt();
+    cancelPendingModelRenders();
     liveSteps.clear();
     liveTools.clear();
     setRunning(true);
@@ -1085,13 +1167,7 @@ runForm.addEventListener("submit", (event) => {{
         .then(() => {{ hideThinking(); }})
         .catch((error) => {{
             if (error && error.name === "StreamUnavailable") {{
-                // A proxy, tunnel, or in-app browser is blocking the live stream.
-                // Fall back to a plain form POST: the page reloads with the full
-                // answer, just without the live typing animation.
-                showThinking("");
-                promptInput.value = promptText;
-                runForm.submit();
-                return;
+                pendingUserMessage.remove();
             }}
             promptInput.value = promptText;
             resizePrompt();
@@ -1102,6 +1178,7 @@ runForm.addEventListener("submit", (event) => {{
 window.addEventListener("pageshow", () => {{
     setRunning(false);
     hideThinking();
+    cancelPendingModelRenders();
     liveSteps.clear();
     liveTools.clear();
     resizePrompt();
@@ -1310,7 +1387,7 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         reasoning_effort: str,
         *,
         event_callback=None,
-    ) -> None:
+    ) -> AgentResult:
         conversation_path, usage_path, trace_path, _ = conversation_paths(
             username,
             conversation_id,
@@ -1323,8 +1400,9 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                 reasoning_effort=reasoning_effort,
                 event_callback=event_callback,
             )
-            agent.run(prompt)
+            result = agent.run(prompt)
             update_conversation_metadata(username, conversation_id, prompt)
+            return result
 
     def _stream_agent_run(
         self,
@@ -1355,7 +1433,7 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
 
         try:
             send_event({"type": "stream_start"})
-            self._run_agent(
+            result = self._run_agent(
                 username,
                 conversation_id,
                 prompt,
@@ -1365,7 +1443,18 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             send_event(
                 {
                     "type": "done",
-                    "redirect": f"/chat/{conversation_id}?reasoning_effort={reasoning_effort}",
+                    "final_step": result.steps,
+                    "answer_html": render_markdown(result.answer),
+                    "usage_html": render_usage(
+                        UsageState(
+                            turn=result.usage,
+                            conversation=result.conversation_usage,
+                            current_context_tokens=result.current_context_tokens,
+                        )
+                    ),
+                    "conversation_title": read_conversation_metadata(
+                        username, conversation_id
+                    )["title"],
                 }
             )
         except Exception as exc:
@@ -1523,7 +1612,8 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+            "default-src 'none'; connect-src 'self'; style-src 'unsafe-inline'; "
+            "script-src 'unsafe-inline'; "
             "form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
         )
         self.send_header("Content-Length", str(len(body)))
