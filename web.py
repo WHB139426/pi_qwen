@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import hmac
 import html
+import hashlib
+import json
 import os
+import re
 import secrets
+import shutil
 import traceback
+from datetime import datetime
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -23,15 +28,21 @@ from main import CONTEXT_WINDOW, create_agent
 
 HOST = "127.0.0.1"
 PORT = 8765
-USERNAME = "haibo"
 SESSION_COOKIE_NAME = "haibo_agent_session"
 MAX_PROMPT_CHARS = 20_000
 MAX_REQUEST_BYTES = 64 * 1024
+PASSWORD_HASH_ITERATIONS = 600_000
 DEFAULT_REASONING_EFFORT = "max"
 REASONING_EFFORTS = ("low", "high", "max")
-CONVERSATIONS_ROOT = Path("./tmp/conversations")
-CONVERSATION_LOCKS: dict[str, Lock] = {}
+USERS_PATH = Path("./tmp/web_users.json")
+USER_WORKSPACES_ROOT = Path("./tmp/users")
+USERNAME_PATTERN = re.compile(r"[a-z0-9_]{3,32}")
+USER_LOCKS: dict[str, Lock] = {}
+USER_LOCKS_GUARD = Lock()
+CONVERSATION_LOCKS: dict[tuple[str, str], Lock] = {}
 CONVERSATION_LOCKS_GUARD = Lock()
+SESSIONS: dict[str, str] = {}
+SESSIONS_LOCK = Lock()
 MARKDOWN_EXTENSIONS = ["fenced_code", "sane_lists", "tables"]
 MARKDOWN_TAGS = set(bleach.sanitizer.ALLOWED_TAGS) | {
     "br",
@@ -57,19 +68,56 @@ MARKDOWN_ATTRIBUTES = {
 }
 
 
+def normalize_username(username: str) -> str:
+    return username.strip().lower()
+
+
+def validate_username(username: str) -> str:
+    username = normalize_username(username)
+    if USERNAME_PATTERN.fullmatch(username) is None:
+        raise ValueError("Username must be 3-32 characters using lowercase letters, numbers, or underscores.")
+    return username
+
+
+def user_root(username: str) -> Path:
+    username = validate_username(username)
+    return USER_WORKSPACES_ROOT / username
+
+
 def validate_conversation_id(conversation_id: str) -> str:
     try:
-        parsed = UUID(conversation_id)
-    except ValueError as exc:
+        created_at, uuid_part = conversation_id.split("_", 1)
+        datetime.strptime(created_at, "%Y%m%d-%H%M%S")
+        parsed = UUID(uuid_part)
+    except (ValueError, AttributeError) as exc:
         raise ValueError("invalid conversation id") from exc
-    if str(parsed) != conversation_id:
+    if str(parsed) != uuid_part:
         raise ValueError("invalid conversation id")
     return conversation_id
 
 
-def conversation_paths(conversation_id: str) -> tuple[Path, Path, Path]:
+def new_conversation_id() -> str:
+    created_at = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    return f"{created_at}_{uuid4()}"
+
+
+def conversations_root(username: str) -> Path:
+    return user_root(username) / "conversations"
+
+
+def conversation_paths(username: str, conversation_id: str) -> tuple[Path, Path, Path, Path]:
     conversation_id = validate_conversation_id(conversation_id)
-    directory = CONVERSATIONS_ROOT / conversation_id
+    directory = conversations_root(username) / conversation_id
+    return (
+        directory / "conversation.json",
+        directory / "usage.json",
+        directory / "trace.txt",
+        directory / "metadata.json",
+    )
+
+
+def legacy_user_paths(username: str) -> tuple[Path, Path, Path]:
+    directory = user_root(username)
     return (
         directory / "conversation.json",
         directory / "usage.json",
@@ -77,26 +125,251 @@ def conversation_paths(conversation_id: str) -> tuple[Path, Path, Path]:
     )
 
 
-def conversation_lock(conversation_id: str) -> Lock:
-    conversation_id = validate_conversation_id(conversation_id)
+def user_lock(username: str) -> Lock:
+    username = validate_username(username)
+    with USER_LOCKS_GUARD:
+        return USER_LOCKS.setdefault(username, Lock())
+
+
+def conversation_lock(username: str, conversation_id: str) -> Lock:
+    key = (validate_username(username), validate_conversation_id(conversation_id))
     with CONVERSATION_LOCKS_GUARD:
-        return CONVERSATION_LOCKS.setdefault(conversation_id, Lock())
+        return CONVERSATION_LOCKS.setdefault(key, Lock())
 
 
-def load_messages(conversation_id: str) -> list[Message]:
-    conversation_path, _, _ = conversation_paths(conversation_id)
+def load_messages(username: str, conversation_id: str) -> list[Message]:
+    conversation_path, _, _, _ = conversation_paths(username, conversation_id)
     store = JsonConversationStore(conversation_path)
     if not store.exists():
         return []
     return store.load()
 
 
-def load_usage_state(conversation_id: str) -> UsageState:
-    _, usage_path, _ = conversation_paths(conversation_id)
+def load_usage_state(username: str, conversation_id: str) -> UsageState:
+    _, usage_path, _, _ = conversation_paths(username, conversation_id)
     store = JsonUsageStore(usage_path)
     if not store.exists():
         return UsageState()
     return store.load()
+
+
+def conversation_title(messages: list[Message]) -> str:
+    for message in messages:
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            compact = " ".join(content.split())
+            return compact[:48] + ("…" if len(compact) > 48 else "")
+    return "New chat"
+
+
+def write_conversation_metadata(
+    username: str,
+    conversation_id: str,
+    *,
+    title: str,
+    created_at: str,
+    updated_at: str,
+) -> None:
+    _, _, _, metadata_path = conversation_paths(username, conversation_id)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "id": conversation_id,
+        "title": title,
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+    temporary_path = metadata_path.with_suffix(".json.tmp")
+    temporary_path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(metadata_path)
+
+
+def read_conversation_metadata(username: str, conversation_id: str) -> dict[str, str]:
+    _, _, _, metadata_path = conversation_paths(username, conversation_id)
+    data = json.loads(metadata_path.read_text(encoding="utf-8"))
+    required = ("id", "title", "created_at", "updated_at")
+    if not isinstance(data, dict) or any(not isinstance(data.get(key), str) for key in required):
+        raise ValueError(f"Invalid conversation metadata: {metadata_path}")
+    if data["id"] != conversation_id:
+        raise ValueError(f"Conversation metadata ID mismatch: {metadata_path}")
+    return {key: data[key] for key in required}
+
+
+def create_conversation(username: str) -> str:
+    username = validate_username(username)
+    with user_lock(username):
+        conversation_id = new_conversation_id()
+        now = datetime.now().astimezone().isoformat(timespec="microseconds")
+        write_conversation_metadata(
+            username,
+            conversation_id,
+            title="New chat",
+            created_at=now,
+            updated_at=now,
+        )
+        return conversation_id
+
+
+def list_conversations(username: str) -> list[dict[str, str]]:
+    root = conversations_root(username)
+    if not root.is_dir():
+        return []
+    conversations = []
+    for directory in root.iterdir():
+        if not directory.is_dir():
+            continue
+        try:
+            conversation_id = validate_conversation_id(directory.name)
+            conversations.append(read_conversation_metadata(username, conversation_id))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+    conversations.sort(key=lambda item: item["updated_at"], reverse=True)
+    return conversations
+
+
+def migrate_legacy_conversation(username: str) -> str | None:
+    legacy_paths = legacy_user_paths(username)
+    if not any(path.exists() for path in legacy_paths):
+        return None
+    conversation_id = new_conversation_id()
+    new_paths = conversation_paths(username, conversation_id)
+    new_paths[0].parent.mkdir(parents=True, exist_ok=False)
+    for old_path, new_path in zip(legacy_paths, new_paths[:3]):
+        if old_path.exists():
+            old_path.replace(new_path)
+    messages = JsonConversationStore(new_paths[0]).load() if new_paths[0].exists() else []
+    now = datetime.now().astimezone().isoformat(timespec="microseconds")
+    write_conversation_metadata(
+        username,
+        conversation_id,
+        title=conversation_title(messages),
+        created_at=now,
+        updated_at=now,
+    )
+    return conversation_id
+
+
+def ensure_user_conversation(username: str) -> str:
+    username = validate_username(username)
+    with user_lock(username):
+        migrated_id = migrate_legacy_conversation(username)
+        conversations = list_conversations(username)
+        if conversations:
+            return migrated_id or conversations[0]["id"]
+        conversation_id = new_conversation_id()
+        now = datetime.now().astimezone().isoformat(timespec="microseconds")
+        write_conversation_metadata(
+            username,
+            conversation_id,
+            title="New chat",
+            created_at=now,
+            updated_at=now,
+        )
+        return conversation_id
+
+
+def update_conversation_metadata(username: str, conversation_id: str, prompt: str) -> None:
+    metadata = read_conversation_metadata(username, conversation_id)
+    if metadata["title"] == "New chat":
+        metadata["title"] = conversation_title([{"role": "user", "content": prompt}])
+    metadata["updated_at"] = datetime.now().astimezone().isoformat(timespec="microseconds")
+    write_conversation_metadata(username, conversation_id, **{
+        "title": metadata["title"],
+        "created_at": metadata["created_at"],
+        "updated_at": metadata["updated_at"],
+    })
+
+
+def hash_password(password: str, salt: bytes, iterations: int) -> str:
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        iterations,
+    ).hex()
+
+
+class JsonUserStore:
+    """Small persistent user database with salted PBKDF2 password hashes."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.lock = Lock()
+
+    def ensure_user(self, username: str, password: str) -> None:
+        username = validate_username(username)
+        with self.lock:
+            data = self._load_unlocked()
+            if username in data["users"]:
+                return
+            data["users"][username] = self._password_record(password)
+            self._save_unlocked(data)
+
+    def create_user(self, username: str, password: str) -> bool:
+        username = validate_username(username)
+        with self.lock:
+            data = self._load_unlocked()
+            if username in data["users"]:
+                return False
+            data["users"][username] = self._password_record(password)
+            self._save_unlocked(data)
+            return True
+
+    def authenticate(self, username: str, password: str) -> bool:
+        try:
+            username = validate_username(username)
+        except ValueError:
+            return False
+        with self.lock:
+            record = self._load_unlocked()["users"].get(username)
+        if not isinstance(record, dict):
+            return False
+        try:
+            salt = bytes.fromhex(record["salt"])
+            iterations = int(record["iterations"])
+            expected = str(record["password_hash"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        actual = hash_password(password, salt, iterations)
+        return hmac.compare_digest(actual, expected)
+
+    def _password_record(self, password: str) -> dict[str, str | int]:
+        salt = secrets.token_bytes(16)
+        return {
+            "salt": salt.hex(),
+            "password_hash": hash_password(password, salt, PASSWORD_HASH_ITERATIONS),
+            "iterations": PASSWORD_HASH_ITERATIONS,
+            "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+
+    def _load_unlocked(self) -> dict[str, object]:
+        if not self.path.exists():
+            return {"version": 1, "users": {}}
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(data, dict)
+            or data.get("version") != 1
+            or not isinstance(data.get("users"), dict)
+        ):
+            raise ValueError(f"Invalid user database: {self.path}")
+        return data
+
+    def _save_unlocked(self, data: dict[str, object]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = self.path.with_suffix(f"{self.path.suffix}.tmp")
+        temporary_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary_path.chmod(0o600)
+        os.replace(temporary_path, self.path)
+
+
+USER_STORE = JsonUserStore(USERS_PATH)
 
 
 def render_markdown(content: str) -> str:
@@ -146,21 +419,44 @@ def render_reasoning_options(selected: str) -> str:
     )
 
 
-def render_login_page(*, username: str = USERNAME, error: str = "") -> bytes:
+def render_auth_page(
+    *,
+    mode: str,
+    username: str = "",
+    error: str = "",
+) -> bytes:
+    if mode not in {"login", "register"}:
+        raise ValueError("invalid authentication page mode")
+    is_register = mode == "register"
     username_html = html.escape(username)
     error_html = html.escape(error)
-    error_section = f'<div class="login-error">{error_html}</div>' if error_html else ""
+    error_section = f'<div class="auth-error">{error_html}</div>' if error_html else ""
+    title = "Create account" if is_register else "Sign in"
+    subtitle = "Register to start your conversation" if is_register else "Sign in to continue"
+    action = "/register" if is_register else "/login"
+    password_autocomplete = "new-password" if is_register else "current-password"
+    confirm_password = ""
+    if is_register:
+        confirm_password = f"""
+<label for="confirm-password">Confirm password</label>
+<input id="confirm-password" name="confirm_password" type="password" autocomplete="new-password" required>
+"""
+    alternate = (
+        '<p class="auth-switch">Already have an account? <a href="/login">Sign in</a></p>'
+        if is_register
+        else '<p class="auth-switch">New here? <a href="/register">Create an account</a></p>'
+    )
     page = f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sign in · Haibo's GLM-5.3-Flash</title>
+<title>{title} · Haibo's GLM-5.3-Flash</title>
 <style>
 * {{ box-sizing: border-box; }}
 :root {{ color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
 body {{ display: grid; min-height: 100vh; margin: 0; place-items: center; padding: 1.25rem; color: #ededed; background: #111; }}
-.login-card {{ width: min(100%, 420px); padding: 2rem; border: 1px solid #303030; border-radius: 1.4rem; background: #1b1b1b; box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35); }}
+.auth-card {{ width: min(100%, 420px); padding: 2rem; border: 1px solid #303030; border-radius: 1.4rem; background: #1b1b1b; box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35); }}
 .brand {{ margin-bottom: 1.8rem; text-align: center; }}
 .brand h1 {{ margin: 0; font-size: 1.65rem; letter-spacing: -0.035em; }}
 .brand p {{ margin: 0.55rem 0 0; color: #888; font-size: 0.92rem; }}
@@ -169,28 +465,41 @@ input {{ width: 100%; margin-bottom: 1rem; padding: 0.82rem 0.9rem; border: 1px 
 input:focus {{ border-color: #666; box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.05); }}
 button {{ width: 100%; margin-top: 0.25rem; padding: 0.82rem; border: 0; border-radius: 0.75rem; color: white; background: #2f6fdb; cursor: pointer; font: inherit; font-weight: 650; }}
 button:hover {{ background: #3d7be3; }}
-.login-error {{ margin-bottom: 1rem; padding: 0.75rem; border: 1px solid #713939; border-radius: 0.7rem; color: #ffb4b4; background: #2a1717; font-size: 0.9rem; }}
+.auth-error {{ margin-bottom: 1rem; padding: 0.75rem; border: 1px solid #713939; border-radius: 0.7rem; color: #ffb4b4; background: #2a1717; font-size: 0.9rem; }}
+.auth-switch {{ margin: 1.2rem 0 0; color: #888; text-align: center; font-size: 0.88rem; }}
+.auth-switch a {{ color: #b9cdf3; text-decoration: none; }}
+.auth-switch a:hover {{ text-decoration: underline; }}
 </style>
 </head>
 <body>
-<main class="login-card">
+<main class="auth-card">
 <header class="brand">
 <h1>Haibo's GLM-5.3-Flash</h1>
-<p>Sign in to continue</p>
+<p>{subtitle}</p>
 </header>
 {error_section}
-<form method="post" action="/login">
+<form method="post" action="{action}">
 <label for="username">Username</label>
-<input id="username" name="username" value="{username_html}" autocomplete="username" required autofocus>
+<input id="username" name="username" value="{username_html}" minlength="3" maxlength="32" pattern="[a-z0-9_]+" autocomplete="username" required autofocus>
 <label for="password">Password</label>
-<input id="password" name="password" type="password" autocomplete="current-password" required>
-<button type="submit">Sign in</button>
+<input id="password" name="password" type="password" autocomplete="{password_autocomplete}" required>
+{confirm_password}
+<button type="submit">{title}</button>
 </form>
+{alternate}
 </main>
 </body>
 </html>
 """
     return page.encode("utf-8")
+
+
+def render_login_page(*, username: str = "", error: str = "") -> bytes:
+    return render_auth_page(mode="login", username=username, error=error)
+
+
+def render_register_page(*, username: str = "", error: str = "") -> bytes:
+    return render_auth_page(mode="register", username=username, error=error)
 
 
 def render_usage(state: UsageState) -> str:
@@ -217,22 +526,69 @@ def render_usage(state: UsageState) -> str:
 """
 
 
+def render_sidebar(
+    username: str,
+    conversations: list[dict[str, str]],
+    current_conversation_id: str,
+) -> str:
+    items = []
+    for conversation in conversations:
+        conversation_id = validate_conversation_id(conversation["id"])
+        title = html.escape(conversation["title"])
+        active = " active" if conversation_id == current_conversation_id else ""
+        items.append(
+            f"""
+<div class="conversation-item{active}">
+<a class="conversation-link" href="/chat/{conversation_id}" title="{title}">{title}</a>
+<form class="delete-form" method="post" action="/chat/{conversation_id}/delete">
+<button class="delete-button" type="submit" aria-label="Delete {title}" title="Delete conversation">&times;</button>
+</form>
+</div>
+"""
+        )
+    history_items = "".join(items) or '<p class="no-conversations">No conversations yet</p>'
+    return f"""
+<button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-label="Open conversation history" aria-controls="sidebar" aria-expanded="false">&#9776;</button>
+<div id="sidebar-backdrop" class="sidebar-backdrop" hidden></div>
+<aside id="sidebar" class="sidebar">
+<div class="sidebar-header">
+<div class="sidebar-brand">Haibo's GLM</div>
+<button id="sidebar-close" class="sidebar-close" type="button" aria-label="Close conversation history">&times;</button>
+</div>
+<form method="post" action="/new">
+<button id="new-button" class="new-chat-button" type="submit"><span aria-hidden="true">&#9998;</span> New chat</button>
+</form>
+<div class="history-label">Recent</div>
+<nav class="conversation-list" aria-label="Conversation history">{history_items}</nav>
+<div class="sidebar-account">
+<div class="account-name" title="Signed in user">{html.escape(username)}</div>
+<form method="post" action="/logout">
+<button class="logout-button" type="submit">Log out</button>
+</form>
+</div>
+</aside>
+"""
+
+
 def render_page(
     *,
+    username: str,
     conversation_id: str,
+    conversations: list[dict[str, str]],
     messages: list[Message] | None = None,
     usage_state: UsageState | None = None,
     prompt: str = "",
     error: str = "",
     reasoning_effort: str = DEFAULT_REASONING_EFFORT,
 ) -> bytes:
+    username = validate_username(username)
     conversation_id = validate_conversation_id(conversation_id)
-    conversation_url = f"/chat/{conversation_id}"
     messages = messages or []
     if reasoning_effort not in REASONING_EFFORTS:
         reasoning_effort = DEFAULT_REASONING_EFFORT
 
     history_html = render_history(messages)
+    sidebar_html = render_sidebar(username, conversations, conversation_id)
     usage_html = render_usage(usage_state or UsageState())
     reasoning_options = render_reasoning_options(reasoning_effort)
     reasoning_label = reasoning_effort.capitalize()
@@ -255,6 +611,28 @@ def render_page(
 body {{ min-height: 100vh; margin: 0; color: #ededed; background: #111; }}
 button, textarea, select {{ font: inherit; }}
 button, select {{ color: inherit; }}
+.sidebar {{ position: fixed; z-index: 20; inset: 0 auto 0 0; display: flex; width: 260px; flex-direction: column; padding: 0.9rem 0.7rem; border-right: 1px solid #272727; background: #0c0c0c; }}
+.sidebar-header {{ display: flex; align-items: center; justify-content: space-between; padding: 0.35rem 0.45rem 0.9rem; }}
+.sidebar-brand {{ color: #eee; font-weight: 650; letter-spacing: -0.02em; }}
+.sidebar-close, .sidebar-toggle {{ display: none; border: 0; color: #aaa; background: transparent; cursor: pointer; }}
+.new-chat-button {{ display: flex; width: 100%; align-items: center; gap: 0.65rem; padding: 0.7rem 0.75rem; border: 1px solid #303030; border-radius: 0.75rem; color: #eee; background: #1b1b1b; cursor: pointer; text-align: left; }}
+.new-chat-button:hover {{ background: #252525; }}
+.history-label {{ padding: 1.35rem 0.65rem 0.45rem; color: #696969; font-size: 0.75rem; font-weight: 650; text-transform: uppercase; letter-spacing: 0.06em; }}
+.conversation-list {{ min-height: 0; flex: 1; overflow-y: auto; }}
+.conversation-item {{ display: flex; min-width: 0; align-items: center; margin: 0.1rem 0; border-radius: 0.65rem; }}
+.conversation-item:hover, .conversation-item.active {{ background: #202020; }}
+.conversation-link {{ min-width: 0; flex: 1; padding: 0.62rem 0.7rem; overflow: hidden; color: #bcbcbc; text-decoration: none; text-overflow: ellipsis; white-space: nowrap; font-size: 0.88rem; }}
+.conversation-item.active .conversation-link {{ color: #f0f0f0; }}
+.conversation-item form {{ flex: 0 0 auto; }}
+.delete-button {{ width: 1.8rem; height: 1.8rem; margin-right: 0.25rem; border: 0; border-radius: 50%; color: transparent; background: transparent; cursor: pointer; line-height: 1; }}
+.conversation-item:hover .delete-button, .conversation-item:focus-within .delete-button {{ color: #888; }}
+.delete-button:hover {{ color: #ddd !important; background: #343434; }}
+.no-conversations {{ padding: 0.6rem; color: #666; font-size: 0.82rem; }}
+.sidebar-account {{ display: flex; align-items: center; gap: 0.5rem; padding: 0.75rem 0.4rem 0.15rem; border-top: 1px solid #252525; }}
+.account-name {{ min-width: 0; flex: 1; overflow: hidden; color: #999; text-overflow: ellipsis; white-space: nowrap; font-size: 0.82rem; }}
+.logout-button {{ padding: 0.4rem 0.58rem; border: 1px solid #333; border-radius: 999px; color: #888; background: #171717; cursor: pointer; font-size: 0.76rem; }}
+.logout-button:hover {{ color: #ddd; border-color: #555; }}
+.main-content {{ min-height: 100vh; margin-left: 260px; }}
 .shell {{ width: min(100%, 980px); min-height: 100vh; margin: 0 auto; padding: 3rem 1.25rem; }}
 .landing-page .shell {{ display: flex; flex-direction: column; justify-content: center; padding-bottom: 8vh; }}
 .brand {{ margin-bottom: 1.6rem; text-align: center; }}
@@ -290,20 +668,17 @@ button, select {{ color: inherit; }}
 .send-button {{ display: grid; width: 2.35rem; height: 2.35rem; place-items: center; border: 0; border-radius: 50%; color: #fff; background: #2f6fdb; cursor: pointer; font-size: 1.2rem; line-height: 1; }}
 .send-button:hover {{ background: #3d7be3; }}
 .send-button:disabled {{ cursor: wait; opacity: 0.45; }}
-.new-form {{ margin-top: 0.85rem; text-align: center; }}
-.new-button {{ padding: 0.55rem 0.9rem; border: 1px solid #383838; border-radius: 999px; color: #aaa; background: transparent; cursor: pointer; }}
-.new-button:hover {{ color: #eee; border-color: #555; }}
-.logout-form {{ position: fixed; top: 1rem; right: 1rem; z-index: 2; }}
-.logout-button {{ padding: 0.45rem 0.7rem; border: 1px solid #333; border-radius: 999px; color: #888; background: #171717; cursor: pointer; font-size: 0.82rem; }}
-.logout-button:hover {{ color: #ddd; border-color: #555; }}
 .usage {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.75rem; margin: 2rem 0 1rem; color: #aaa; font-size: 0.86rem; }}
 .usage-card {{ padding: 0.85rem; border: 1px solid #303030; border-radius: 0.8rem; background: #181818; }}
 .usage-card h2 {{ margin: 0 0 0.45rem; color: #d7d7d7; font-size: 0.9rem; }}
 .context-usage {{ grid-column: 1 / -1; }}
+.site-footer {{ margin-top: 1.5rem; color: #686868; text-align: center; font-size: 0.75rem; line-height: 1.6; }}
+.site-footer a {{ color: #858585; text-decoration: none; }}
+.site-footer a:hover {{ color: #b5b5b5; text-decoration: underline; }}
 .error {{ margin-bottom: 1rem; padding: 0.9rem; border: 1px solid #713939; border-radius: 0.8rem; color: #ffb4b4; background: #2a1717; }}
 .error h2 {{ margin-top: 0; font-size: 1rem; }}
 .error pre {{ margin-bottom: 0; white-space: pre-wrap; }}
-.thinking {{ display: flex; align-items: center; justify-content: center; gap: 0.65rem; margin-top: 1rem; color: #aaa; }}
+.thinking {{ display: flex; width: fit-content; align-items: center; justify-content: center; gap: 0.65rem; margin: 0 auto 0.8rem; padding: 0.65rem 1rem; border: 1px solid #3a3a3a; border-radius: 999px; color: #ddd; background: #1c1c1c; box-shadow: 0 10px 32px rgba(0, 0, 0, 0.35); }}
 .thinking[hidden] {{ display: none; }}
 .spinner {{
     width: 1.1rem;
@@ -315,7 +690,14 @@ button, select {{ color: inherit; }}
 }}
 @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
 @media (prefers-reduced-motion: reduce) {{ .spinner {{ animation-duration: 1.6s; }} }}
-@media (max-width: 600px) {{
+@media (max-width: 760px) {{
+    .sidebar {{ width: min(86vw, 300px); transform: translateX(-100%); transition: transform 0.2s ease; box-shadow: 18px 0 60px rgba(0, 0, 0, 0.45); }}
+    .sidebar.open {{ transform: translateX(0); }}
+    .sidebar-toggle {{ position: fixed; z-index: 15; top: 0.8rem; left: 0.75rem; display: grid; width: 2.25rem; height: 2.25rem; place-items: center; border: 1px solid #333; border-radius: 0.65rem; background: #181818; font-size: 1.1rem; }}
+    .sidebar-close {{ display: block; width: 2rem; height: 2rem; font-size: 1.35rem; }}
+    .sidebar-backdrop {{ position: fixed; z-index: 19; inset: 0; background: rgba(0, 0, 0, 0.6); }}
+    .sidebar-backdrop[hidden] {{ display: none; }}
+    .main-content {{ margin-left: 0; }}
     .shell {{ padding: 1.5rem 0.85rem; }}
     .brand h1 {{ font-size: 2rem; letter-spacing: -0.04em; }}
     .composer {{ border-radius: 1.2rem; }}
@@ -326,14 +708,17 @@ button, select {{ color: inherit; }}
 </style>
 </head>
 <body class="{page_class}">
-<form class="logout-form" method="post" action="/logout">
-<button class="logout-button" type="submit">Log out</button>
-</form>
+{sidebar_html}
+<div class="main-content">
 <main class="shell">
 <header class="brand"><h1>Haibo's GLM-5.3-Flash</h1></header>
 <div class="history">{history_html}</div>
 {error_section}
-<form id="run-form" class="composer" method="post" action="{conversation_url}/run">
+<div id="thinking" class="thinking" role="status" aria-live="polite" hidden>
+<span class="spinner" aria-hidden="true"></span>
+<span>Model is thinking...</span>
+</div>
+<form id="run-form" class="composer" method="post" action="/chat/{conversation_id}/run">
 <textarea id="prompt" name="prompt" rows="1" placeholder="Ask anything, or task an agent..." required>{prompt_html}</textarea>
 <div class="composer-footer">
 <div class="effort-control">
@@ -346,15 +731,12 @@ button, select {{ color: inherit; }}
 <button id="send-button" class="send-button" type="submit" aria-label="Send">&#8593;</button>
 </div>
 </form>
-<form class="new-form" method="post" action="/new">
-<button id="new-button" class="new-button" type="submit">New Conversation</button>
-</form>
 {usage_html}
-<div id="thinking" class="thinking" role="status" aria-live="polite" hidden>
-<span class="spinner" aria-hidden="true"></span>
-<span>Model is thinking...</span>
-</div>
+<footer class="site-footer">
+Powered by the custom-built <a href="https://github.com/WHB139426/pi_qwen/" target="_blank" rel="noopener noreferrer">pi_qwen</a> agent framework and Z.ai's <a href="https://docs.z.ai/guides/vlm/glm-5.3-flash" target="_blank" rel="noopener noreferrer">GLM-5.3-Flash</a>, locally deployed on 4&times; NVIDIA H200 GPUs.
+</footer>
 </main>
+</div>
 <script>
 const runForm = document.getElementById("run-form");
 const promptInput = document.getElementById("prompt");
@@ -363,6 +745,11 @@ const newButton = document.getElementById("new-button");
 const reasoningEffort = document.getElementById("reasoning-effort");
 const effortValue = document.getElementById("effort-value");
 const thinking = document.getElementById("thinking");
+const sidebar = document.getElementById("sidebar");
+const sidebarToggle = document.getElementById("sidebar-toggle");
+const sidebarClose = document.getElementById("sidebar-close");
+const sidebarBackdrop = document.getElementById("sidebar-backdrop");
+const deleteForms = document.querySelectorAll(".delete-form");
 
 function resizePrompt() {{
     promptInput.style.height = "auto";
@@ -376,10 +763,28 @@ function syncEffortLabel() {{
 promptInput.addEventListener("input", resizePrompt);
 reasoningEffort.addEventListener("change", syncEffortLabel);
 
+function setSidebar(open) {{
+    sidebar.classList.toggle("open", open);
+    sidebarBackdrop.hidden = !open;
+    sidebarToggle.setAttribute("aria-expanded", String(open));
+}}
+
+sidebarToggle.addEventListener("click", () => setSidebar(true));
+sidebarClose.addEventListener("click", () => setSidebar(false));
+sidebarBackdrop.addEventListener("click", () => setSidebar(false));
+deleteForms.forEach((form) => {{
+    form.addEventListener("submit", (event) => {{
+        if (!window.confirm("Delete this conversation permanently?")) {{
+            event.preventDefault();
+        }}
+    }});
+}});
+
 runForm.addEventListener("submit", () => {{
     promptInput.readOnly = true;
     sendButton.disabled = true;
     newButton.disabled = true;
+    deleteForms.forEach((form) => {{ form.querySelector("button").disabled = true; }});
     thinking.hidden = false;
 }});
 
@@ -387,6 +792,7 @@ window.addEventListener("pageshow", () => {{
     promptInput.readOnly = false;
     sendButton.disabled = false;
     newButton.disabled = false;
+    deleteForms.forEach((form) => {{ form.querySelector("button").disabled = false; }});
     thinking.hidden = true;
     resizePrompt();
     syncEffortLabel();
@@ -400,15 +806,18 @@ window.addEventListener("pageshow", () => {{
 
 def render_current_page(
     *,
+    username: str,
     conversation_id: str,
     prompt: str = "",
     error: str = "",
     reasoning_effort: str = DEFAULT_REASONING_EFFORT,
 ) -> bytes:
     return render_page(
+        username=username,
         conversation_id=conversation_id,
-        messages=load_messages(conversation_id),
-        usage_state=load_usage_state(conversation_id),
+        conversations=list_conversations(username),
+        messages=load_messages(username, conversation_id),
+        usage_state=load_usage_state(username, conversation_id),
         prompt=prompt,
         error=error,
         reasoning_effort=reasoning_effort,
@@ -416,25 +825,36 @@ def render_current_page(
 
 
 class AgentRequestHandler(BaseHTTPRequestHandler):
-    access_token = ""
-    session_token = ""
-
     def do_GET(self) -> None:
         url = urlsplit(self.path)
         if url.path == "/login":
-            if self._is_authenticated():
-                self._redirect_new_conversation(DEFAULT_REASONING_EFFORT)
+            if self._authenticated_user() is not None:
+                self._redirect_home(DEFAULT_REASONING_EFFORT)
             else:
                 self._send_html(200, render_login_page())
             return
-        if not self._is_authenticated():
+        if url.path == "/register":
+            if self._authenticated_user() is not None:
+                self._redirect_home(DEFAULT_REASONING_EFFORT)
+            else:
+                self._send_html(200, render_register_page())
+            return
+        username = self._authenticated_user()
+        if username is None:
             self._redirect("/login")
             return
         if url.path == "/":
-            self._redirect_new_conversation(DEFAULT_REASONING_EFFORT)
+            self._redirect_conversation(
+                ensure_user_conversation(username),
+                DEFAULT_REASONING_EFFORT,
+            )
             return
         conversation_id = self._conversation_id_from_path(url.path)
         if conversation_id is None:
+            self.send_error(404)
+            return
+        _, _, _, metadata_path = conversation_paths(username, conversation_id)
+        if not metadata_path.is_file():
             self.send_error(404)
             return
         query = parse_qs(url.query)
@@ -442,8 +862,9 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         if reasoning_effort not in REASONING_EFFORTS:
             reasoning_effort = DEFAULT_REASONING_EFFORT
         try:
-            with conversation_lock(conversation_id):
+            with conversation_lock(username, conversation_id):
                 page = render_current_page(
+                    username=username,
                     conversation_id=conversation_id,
                     reasoning_effort=reasoning_effort,
                 )
@@ -452,7 +873,9 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             self._send_html(
                 500,
                 render_page(
+                    username=username,
                     conversation_id=conversation_id,
+                    conversations=list_conversations(username),
                     error=f"{type(exc).__name__}: {exc}",
                 ),
             )
@@ -462,17 +885,29 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         if url.path == "/login":
             self._login()
             return
-        if not self._is_authenticated():
+        if url.path == "/register":
+            self._register()
+            return
+        username = self._authenticated_user()
+        if username is None:
             self._redirect("/login")
             return
         if url.path == "/logout":
             self._logout()
             return
         if url.path == "/new":
-            self._redirect_new_conversation(DEFAULT_REASONING_EFFORT)
+            self._new_conversation(username)
+            return
+        delete_id = self._conversation_id_from_path(url.path, action="delete")
+        if delete_id is not None:
+            self._delete_conversation(username, delete_id)
             return
         conversation_id = self._conversation_id_from_path(url.path, action="run")
         if conversation_id is None:
+            self.send_error(404)
+            return
+        _, _, _, metadata_path = conversation_paths(username, conversation_id)
+        if not metadata_path.is_file():
             self.send_error(404)
             return
 
@@ -482,6 +917,7 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             self._send_html(
                 400,
                 render_current_page(
+                    username=username,
                     conversation_id=conversation_id,
                     error="Invalid request size.",
                 ),
@@ -493,6 +929,7 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             self._send_html(
                 400,
                 render_current_page(
+                    username=username,
                     conversation_id=conversation_id,
                     prompt=prompt,
                     error="Reasoning effort must be low, high, or max.",
@@ -503,6 +940,7 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             self._send_html(
                 400,
                 render_current_page(
+                    username=username,
                     conversation_id=conversation_id,
                     error="Prompt is required.",
                     reasoning_effort=reasoning_effort,
@@ -513,6 +951,7 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             self._send_html(
                 400,
                 render_current_page(
+                    username=username,
                     conversation_id=conversation_id,
                     prompt=prompt,
                     error=f"Prompt exceeds {MAX_PROMPT_CHARS} characters.",
@@ -522,8 +961,11 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            conversation_path, usage_path, trace_path = conversation_paths(conversation_id)
-            with conversation_lock(conversation_id):
+            conversation_path, usage_path, trace_path, _ = conversation_paths(
+                username,
+                conversation_id,
+            )
+            with conversation_lock(username, conversation_id):
                 agent = create_agent(
                     conversation_path=conversation_path,
                     usage_path=usage_path,
@@ -531,18 +973,39 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                     reasoning_effort=reasoning_effort,
                 )
                 agent.run(prompt)
+                update_conversation_metadata(username, conversation_id, prompt)
             self._redirect_conversation(conversation_id, reasoning_effort)
         except Exception as exc:
             traceback.print_exc()
             self._send_html(
                 500,
                 render_current_page(
+                    username=username,
                     conversation_id=conversation_id,
                     prompt=prompt,
                     error=f"{type(exc).__name__}: {exc}",
                     reasoning_effort=reasoning_effort,
                 ),
             )
+
+    def _new_conversation(self, username: str) -> None:
+        self._redirect_conversation(
+            create_conversation(username),
+            DEFAULT_REASONING_EFFORT,
+        )
+
+    def _delete_conversation(self, username: str, conversation_id: str) -> None:
+        directory = conversation_paths(username, conversation_id)[0].parent
+        with user_lock(username):
+            with conversation_lock(username, conversation_id):
+                if not directory.is_dir():
+                    self.send_error(404)
+                    return
+                shutil.rmtree(directory)
+        self._redirect_conversation(
+            ensure_user_conversation(username),
+            DEFAULT_REASONING_EFFORT,
+        )
 
     def _login(self) -> None:
         try:
@@ -551,19 +1014,57 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             self._send_html(400, render_login_page(error="Invalid request."))
             return
 
-        username = form.get("username", [""])[0].strip()
+        username = normalize_username(form.get("username", [""])[0])
         password = form.get("password", [""])[0]
-        username_matches = hmac.compare_digest(username, USERNAME)
-        password_matches = hmac.compare_digest(password, self.access_token)
-        if not (username_matches and password_matches):
+        if not USER_STORE.authenticate(username, password):
             self._send_html(
                 401,
                 render_login_page(username=username, error="Incorrect username or password."),
             )
             return
+        self._start_session(username)
 
+    def _register(self) -> None:
+        try:
+            form = self._read_form()
+        except ValueError:
+            self._send_html(400, render_register_page(error="Invalid request."))
+            return
+
+        username = normalize_username(form.get("username", [""])[0])
+        password = form.get("password", [""])[0]
+        confirm_password = form.get("confirm_password", [""])[0]
+        try:
+            username = validate_username(username)
+        except ValueError as exc:
+            self._send_html(400, render_register_page(username=username, error=str(exc)))
+            return
+        if not password:
+            self._send_html(
+                400,
+                render_register_page(username=username, error="Password is required."),
+            )
+            return
+        if password != confirm_password:
+            self._send_html(
+                400,
+                render_register_page(username=username, error="Passwords do not match."),
+            )
+            return
+        if not USER_STORE.create_user(username, password):
+            self._send_html(
+                409,
+                render_register_page(username=username, error="Username is already registered."),
+            )
+            return
+        self._start_session(username)
+
+    def _start_session(self, username: str) -> None:
+        session_token = secrets.token_urlsafe(32)
+        with SESSIONS_LOCK:
+            SESSIONS[session_token] = validate_username(username)
         cookie = SimpleCookie()
-        cookie[SESSION_COOKIE_NAME] = self.session_token
+        cookie[SESSION_COOKIE_NAME] = session_token
         cookie[SESSION_COOKIE_NAME]["path"] = "/"
         cookie[SESSION_COOKIE_NAME]["httponly"] = True
         cookie[SESSION_COOKIE_NAME]["samesite"] = "Strict"
@@ -578,7 +1079,10 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _logout(self) -> None:
-        self.__class__.session_token = secrets.token_urlsafe(32)
+        session_token = self._session_token()
+        if session_token is not None:
+            with SESSIONS_LOCK:
+                SESSIONS.pop(session_token, None)
         cookie = SimpleCookie()
         cookie[SESSION_COOKIE_NAME] = ""
         cookie[SESSION_COOKIE_NAME]["path"] = "/"
@@ -595,13 +1099,20 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def _is_authenticated(self) -> bool:
+    def _session_token(self) -> str | None:
         try:
             cookie = SimpleCookie(self.headers.get("Cookie", ""))
         except CookieError:
-            return False
+            return None
         session = cookie.get(SESSION_COOKIE_NAME)
-        return session is not None and hmac.compare_digest(session.value, self.session_token)
+        return session.value if session is not None else None
+
+    def _authenticated_user(self) -> str | None:
+        session_token = self._session_token()
+        if session_token is None:
+            return None
+        with SESSIONS_LOCK:
+            return SESSIONS.get(session_token)
 
     def _is_https_request(self) -> bool:
         forwarded_proto = self.headers.get("X-Forwarded-Proto", "")
@@ -638,18 +1149,18 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
     @staticmethod
     def _conversation_id_from_path(path: str, action: str | None = None) -> str | None:
         parts = path.strip("/").split("/")
-        expected_parts = 3 if action else 2
-        if len(parts) != expected_parts or parts[0] != "chat":
+        expected_length = 3 if action else 2
+        if len(parts) != expected_length or parts[0] != "chat":
             return None
-        if action and parts[2] != action:
+        if action is not None and parts[2] != action:
             return None
         try:
             return validate_conversation_id(parts[1])
         except ValueError:
             return None
 
-    def _redirect_new_conversation(self, reasoning_effort: str) -> None:
-        self._redirect_conversation(str(uuid4()), reasoning_effort)
+    def _redirect_home(self, reasoning_effort: str) -> None:
+        self._redirect(f"/?reasoning_effort={reasoning_effort}")
 
     def _redirect_conversation(self, conversation_id: str, reasoning_effort: str) -> None:
         conversation_id = validate_conversation_id(conversation_id)
@@ -664,15 +1175,9 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    access_token = os.environ.get("AGENT_ACCESS_TOKEN", "")
-    if not access_token:
-        raise SystemExit("AGENT_ACCESS_TOKEN must be set")
-
-    AgentRequestHandler.access_token = access_token
-    AgentRequestHandler.session_token = secrets.token_urlsafe(32)
     server = ThreadingHTTPServer((HOST, PORT), AgentRequestHandler)
     print(f"Agent web server: http://{HOST}:{PORT}")
-    print(f"Username: {USERNAME}")
+    print("Registration: enabled")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
