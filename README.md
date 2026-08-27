@@ -137,6 +137,38 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3.8-27B \
     --gpu-memory-utilization 0.90
 ```
 
+### GLM-5.3-Flash Server
+
+GLM-5.3-Flash currently requires its dedicated vLLM Docker image. The following
+command serves local FP8 weights on four H200 GPUs with the native 1M-token
+context window:
+
+```bash
+sudo docker run --rm \
+    --name glm53-vllm \
+    --gpus '"device=0,1,2,3"' \
+    --ipc=host \
+    --network host \
+    -e VLLM_ENGINE_READY_TIMEOUT_S=3600 \
+    -v /path/to/GLM-5.3-Flash:/model:ro \
+    vllm/vllm-openai:glm53-flash \
+    /model \
+    --served-model-name glm-5.3-flash \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --dtype bfloat16 \
+    --tensor-parallel-size 4 \
+    --max-model-len 1048576 \
+    --max-num-seqs 16 \
+    --gpu-memory-utilization 0.95 \
+    --no-enable-flashinfer-autotune
+```
+
+Replace `/path/to/GLM-5.3-Flash` with the local checkpoint directory for
+[`zai-org/GLM-5.3-Flash`](https://huggingface.co/zai-org/GLM-5.3-Flash).
+The server name used by API clients is `glm-5.3-flash`. Stop the foreground
+container with `Ctrl+C`.
+
 In another terminal, run the agent:
 
 ```bash
