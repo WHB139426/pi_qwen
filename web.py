@@ -706,6 +706,15 @@ button, select {{ color: inherit; }}
 .markdown-body table {{ width: 100%; border-collapse: collapse; }}
 .markdown-body th, .markdown-body td {{ padding: 0.5rem; border: 1px solid #3a3a3a; text-align: left; }}
 .markdown-body a {{ color: #a8c7fa; overflow-wrap: anywhere; }}
+.live-answer-text {{ margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-family: inherit; font-size: 1rem; line-height: 1.65; color: #ededed; }}
+.thinking-line {{ display: flex; align-items: center; gap: 0.55rem; padding: 0.4rem 0.25rem 0.6rem; color: #9a9a9a; font-size: 0.9rem; }}
+.thinking-label {{ color: #9a9a9a; }}
+.thinking-dots {{ display: inline-flex; gap: 0.28rem; }}
+.thinking-dots span {{ width: 0.42rem; height: 0.42rem; border-radius: 50%; background: #7aa2e3; animation: thinking-bounce 1.2s ease-in-out infinite; }}
+.thinking-dots span:nth-child(2) {{ animation-delay: 0.18s; }}
+.thinking-dots span:nth-child(3) {{ animation-delay: 0.36s; }}
+@keyframes thinking-bounce {{ 0%, 80%, 100% {{ transform: scale(0.5); opacity: 0.35; }} 40% {{ transform: scale(1); opacity: 1; }} }}
+@media (prefers-reduced-motion: reduce) {{ .thinking-dots span {{ animation-duration: 2.4s; }} }}
 .composer {{ display: grid; gap: 0.55rem; padding: 0.7rem 0.7rem 0.6rem 1rem; border: 1px solid #383838; border-radius: 1.6rem; background: #202020; box-shadow: 0 18px 60px rgba(0, 0, 0, 0.28); }}
 .composer:focus-within {{ border-color: #555; }}
 .composer textarea {{ display: block; flex: 1; width: 100%; min-height: 1.75rem; max-height: 10rem; padding: 0.3rem 0; resize: none; overflow-y: auto; border: 0; outline: 0; color: #f0f0f0; background: transparent; line-height: 1.45; }}
@@ -729,24 +738,8 @@ button, select {{ color: inherit; }}
 .error {{ margin-bottom: 1rem; padding: 0.9rem; border: 1px solid #713939; border-radius: 0.8rem; color: #ffb4b4; background: #2a1717; }}
 .error h2 {{ margin-top: 0; font-size: 1rem; }}
 .error pre {{ margin-bottom: 0; white-space: pre-wrap; }}
-.activity-panel {{ margin: 0 0 0.8rem; border: 1px solid #303030; border-radius: 0.85rem; color: #999; background-color: #161616; background-image: repeating-linear-gradient(135deg, rgba(255, 255, 255, 0.02) 0, rgba(255, 255, 255, 0.02) 1px, transparent 1px, transparent 8px); box-shadow: 0 10px 32px rgba(0, 0, 0, 0.22); font-size: 0.82rem; }}
-.activity-panel[hidden] {{ display: none; }}
-.activity-panel > details > summary {{ display: flex; align-items: center; gap: 0.6rem; padding: 0.65rem 0.8rem; cursor: pointer; color: #b0b0b0; user-select: none; }}
-.activity-events {{ display: grid; gap: 0.5rem; max-height: 19rem; padding: 0 0.65rem 0.65rem; overflow-y: auto; }}
-.live-step {{ display: grid; gap: 0.45rem; }}
-.live-reasoning {{ margin: 0; }}
 .live-tool-status {{ padding: 0.45rem 0.65rem; color: #777; border-top: 1px solid #292929; }}
-.activity-error {{ padding: 0.65rem; border: 1px solid #713939; border-radius: 0.6rem; color: #ffb4b4; background: #2a1717; white-space: pre-wrap; }}
-.spinner {{
-    width: 1.1rem;
-    height: 1.1rem;
-    border: 2px solid #444;
-    border-top-color: #ddd;
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-}}
-@keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-@media (prefers-reduced-motion: reduce) {{ .spinner {{ animation-duration: 1.6s; }} }}
+.activity-error {{ margin: 0.6rem 0; padding: 0.65rem; border: 1px solid #713939; border-radius: 0.6rem; color: #ffb4b4; background: #2a1717; white-space: pre-wrap; }}
 @media (max-width: 760px) {{
     .sidebar {{ width: min(86vw, 300px); transform: translateX(-100%); transition: transform 0.2s ease; box-shadow: 18px 0 60px rgba(0, 0, 0, 0.45); }}
     .sidebar.open {{ transform: translateX(0); }}
@@ -771,12 +764,6 @@ button, select {{ color: inherit; }}
 <header class="brand"><h1>Haibo's GLM-5.3-Flash</h1></header>
 <div class="history">{history_html}</div>
 {error_section}
-<section id="thinking" class="activity-panel" role="status" aria-live="polite" hidden>
-<details open>
-<summary><span class="spinner" aria-hidden="true"></span><span id="activity-status">Model is thinking...</span></summary>
-<div id="activity-events" class="activity-events"></div>
-</details>
-</section>
 <form id="run-form" class="composer" method="post" action="/chat/{conversation_id}/run">
 <textarea id="prompt" name="prompt" rows="1" placeholder="Ask anything, or task an agent..." required>{prompt_html}</textarea>
 <div class="composer-footer">
@@ -803,16 +790,15 @@ const sendButton = document.getElementById("send-button");
 const newButton = document.getElementById("new-button");
 const reasoningEffort = document.getElementById("reasoning-effort");
 const effortValue = document.getElementById("effort-value");
-const thinking = document.getElementById("thinking");
-const activityStatus = document.getElementById("activity-status");
-const activityEvents = document.getElementById("activity-events");
 const sidebar = document.getElementById("sidebar");
 const sidebarToggle = document.getElementById("sidebar-toggle");
 const sidebarClose = document.getElementById("sidebar-close");
 const sidebarBackdrop = document.getElementById("sidebar-backdrop");
 const deleteForms = document.querySelectorAll(".delete-form");
+const history = document.querySelector(".history");
 const liveSteps = new Map();
 const liveTools = new Map();
+let thinkingLine = null;
 
 function resizePrompt() {{
     promptInput.style.height = "auto";
@@ -844,36 +830,72 @@ deleteForms.forEach((form) => {{
 }});
 
 function setRunning(running) {{
-    promptInput.readOnly = true;
-    if (!running) {{ promptInput.readOnly = false; }}
+    promptInput.readOnly = running;
     sendButton.disabled = running;
     newButton.disabled = running;
     deleteForms.forEach((form) => {{ form.querySelector("button").disabled = running; }});
-    thinking.hidden = !running;
 }}
 
-function ensureLiveStep(stepNumber) {{
+function showThinking(label) {{
+    if (!thinkingLine) {{
+        thinkingLine = document.createElement("div");
+        thinkingLine.className = "thinking-line";
+        thinkingLine.innerHTML = '<span class="thinking-dots" aria-hidden="true"><span></span><span></span><span></span></span><span class="thinking-label"></span>';
+    }}
+    thinkingLine.querySelector(".thinking-label").textContent = label || "Thinking";
+    history.append(thinkingLine);
+    maybeScroll();
+}}
+
+function hideThinking() {{
+    if (thinkingLine) {{ thinkingLine.remove(); thinkingLine = null; }}
+}}
+
+function ensureLiveTurn(stepNumber) {{
     if (liveSteps.has(stepNumber)) {{ return liveSteps.get(stepNumber); }}
-    const step = document.createElement("div");
-    step.className = "live-step";
+    clearEmptyPlaceholder();
+    const section = document.createElement("section");
+    section.className = "message assistant";
+    section.setAttribute("aria-label", "Assistant");
+
+    const trace = document.createElement("div");
+    trace.className = "trace-stack";
 
     const reasoning = document.createElement("details");
-    reasoning.className = "trace-entry live-reasoning";
-    reasoning.open = true;
+    reasoning.className = "trace-entry";
+    reasoning.hidden = true;
     const summary = document.createElement("summary");
     summary.textContent = `Reasoning · Turn ${{stepNumber}}`;
-    const pre = document.createElement("pre");
-    pre.textContent = "Waiting for model output...";
-    reasoning.append(summary, pre);
+    const reasoningPre = document.createElement("pre");
+    reasoning.append(summary, reasoningPre);
+    trace.append(reasoning);
 
-    const tools = document.createElement("div");
-    tools.className = "trace-stack";
-    step.append(reasoning, tools);
-    activityEvents.append(step);
+    section.append(trace);
+    history.append(section);
 
-    const state = {{ raw: "", reasoning: pre, tools }};
+    const state = {{ raw: "", section, trace, reasoning, reasoningPre, contentEl: null }};
     liveSteps.set(stepNumber, state);
     return state;
+}}
+
+function updateReasoning(state, text) {{
+    if (!text) {{ return; }}
+    state.reasoning.hidden = false;
+    state.reasoningPre.textContent = text;
+}}
+
+function ensureContentEl(state) {{
+    if (state.contentEl) {{ return state.contentEl; }}
+    const pre = document.createElement("pre");
+    pre.className = "live-answer-text";
+    state.section.append(pre);
+    state.contentEl = pre;
+    return pre;
+}}
+
+function setContent(state, text) {{
+    if (!text) {{ return; }}
+    ensureContentEl(state).textContent = text;
 }}
 
 function streamedReasoning(raw) {{
@@ -883,20 +905,49 @@ function streamedReasoning(raw) {{
     return raw.slice(reasoningStart, end >= 0 ? end : raw.length).trimStart();
 }}
 
+function streamedContent(raw) {{
+    const marker = raw.indexOf("</think>");
+    if (marker < 0) {{ return ""; }}
+    let content = raw.slice(marker + "</think>".length);
+    content = content.replace(/<tool_call\\b[\\s\\S]*?<\\/tool_call>/g, "");
+    content = content.replace(/<tool_call\\b[\\s\\S]*$/, "");
+    return content.trim();
+}}
+
+function maybeScroll() {{
+    const nearBottom = window.innerHeight + window.scrollY >= document.body.scrollHeight - 160;
+    if (nearBottom) {{ window.scrollTo(0, document.body.scrollHeight); }}
+}}
+
+function clearEmptyPlaceholder() {{
+    const empty = history.querySelector(".empty");
+    if (empty) {{ empty.remove(); }}
+}}
+
+function appendUserMessage(text) {{
+    clearEmptyPlaceholder();
+    const section = document.createElement("section");
+    section.className = "message user";
+    section.setAttribute("aria-label", "You");
+    const pre = document.createElement("pre");
+    pre.textContent = text;
+    section.append(pre);
+    history.append(section);
+}}
+
 function addToolCall(event) {{
-    const step = ensureLiveStep(event.step);
+    const state = ensureLiveTurn(event.step);
     const details = document.createElement("details");
     details.className = "trace-entry";
-    details.open = true;
     const summary = document.createElement("summary");
     summary.textContent = `Tool call · ${{event.name || "tool"}}`;
     const argumentsBlock = document.createElement("pre");
     argumentsBlock.textContent = JSON.stringify(event.arguments || {{}}, null, 2);
     const status = document.createElement("div");
     status.className = "live-tool-status";
-    status.textContent = "Running...";
+    status.textContent = "Running…";
     details.append(summary, argumentsBlock, status);
-    step.tools.append(details);
+    state.trace.append(details);
     liveTools.set(event.tool_call_id, {{ details, status }});
 }}
 
@@ -913,51 +964,61 @@ function addToolResult(event) {{
 }}
 
 function showStreamError(message) {{
-    activityStatus.textContent = "Agent stopped";
+    hideThinking();
     const error = document.createElement("div");
     error.className = "activity-error";
     error.textContent = message;
-    activityEvents.append(error);
+    history.append(error);
     setRunning(false);
-    thinking.hidden = false;
+    maybeScroll();
 }}
 
 function handleAgentEvent(event) {{
     if (event.type === "stream_start") {{
-        activityStatus.textContent = "Model is thinking...";
+        showThinking("Thinking");
         return;
     }}
     if (event.type === "generation_start") {{
-        activityStatus.textContent = `Model is thinking · Turn ${{event.step}}`;
-        ensureLiveStep(event.step);
+        ensureLiveTurn(event.step);
+        showThinking("Thinking");
         return;
     }}
     if (event.type === "model_delta") {{
-        const step = ensureLiveStep(event.step);
-        step.raw += event.delta || "";
-        step.reasoning.textContent = streamedReasoning(step.raw) || "Waiting for reasoning...";
-        activityEvents.scrollTop = activityEvents.scrollHeight;
+        const state = ensureLiveTurn(event.step);
+        state.raw += event.delta || "";
+        updateReasoning(state, streamedReasoning(state.raw));
+        const content = streamedContent(state.raw);
+        if (content) {{
+            setContent(state, content);
+            showThinking("Writing");
+        }} else {{
+            showThinking("Thinking");
+        }}
+        maybeScroll();
         return;
     }}
     if (event.type === "assistant_message") {{
-        const step = ensureLiveStep(event.step);
-        step.reasoning.textContent = event.reasoning_content || "No reasoning content returned.";
+        const state = ensureLiveTurn(event.step);
+        updateReasoning(state, event.reasoning_content || "");
+        setContent(state, event.content || "");
         return;
     }}
     if (event.type === "tool_call") {{
-        activityStatus.textContent = `Running tool · ${{event.name || "tool"}}`;
         addToolCall(event);
-        activityEvents.scrollTop = activityEvents.scrollHeight;
+        showThinking(`Using ${{event.name || "tool"}}`);
+        maybeScroll();
         return;
     }}
     if (event.type === "tool_result") {{
         addToolResult(event);
-        activityStatus.textContent = "Tool completed; model is continuing...";
-        activityEvents.scrollTop = activityEvents.scrollHeight;
+        showThinking("Thinking");
+        maybeScroll();
         return;
     }}
     if (event.type === "final_answer") {{
-        activityStatus.textContent = "Preparing final answer...";
+        const state = ensureLiveTurn(event.step);
+        setContent(state, event.content || "");
+        showThinking("Finalizing");
         return;
     }}
     if (event.type === "error") {{
@@ -969,12 +1030,19 @@ function handleAgentEvent(event) {{
     }}
 }}
 
-async function runAgentStream() {{
-    const response = await fetch(runForm.action, {{
-        method: "POST",
-        body: new URLSearchParams(new FormData(runForm)),
-        headers: {{ "Accept": "text/event-stream" }},
-    }});
+async function runAgentStream(body) {{
+    let response;
+    try {{
+        response = await fetch(runForm.action, {{
+            method: "POST",
+            body: body,
+            headers: {{ "Accept": "text/event-stream" }},
+        }});
+    }} catch (err) {{
+        const streamError = new Error("Live streaming request could not be established (" + err.message + ")");
+        streamError.name = "StreamUnavailable";
+        throw streamError;
+    }}
     if (!response.ok || !response.body) {{
         throw new Error(`Request failed with status ${{response.status}}`);
     }}
@@ -1000,16 +1068,40 @@ async function runAgentStream() {{
 
 runForm.addEventListener("submit", (event) => {{
     event.preventDefault();
-    activityEvents.replaceChildren();
+    const promptText = promptInput.value;
+    if (!promptText.trim()) {{ return; }}
+    const body = new URLSearchParams(new FormData(runForm));
+    appendUserMessage(promptText);
+    document.body.classList.remove("landing-page");
+    document.body.classList.add("chat-page");
+    promptInput.value = "";
+    resizePrompt();
     liveSteps.clear();
     liveTools.clear();
     setRunning(true);
-    runAgentStream().catch((error) => showStreamError(error.message));
+    showThinking("Thinking");
+    maybeScroll();
+    runAgentStream(body)
+        .then(() => {{ hideThinking(); }})
+        .catch((error) => {{
+            if (error && error.name === "StreamUnavailable") {{
+                // A proxy, tunnel, or in-app browser is blocking the live stream.
+                // Fall back to a plain form POST: the page reloads with the full
+                // answer, just without the live typing animation.
+                showThinking("");
+                promptInput.value = promptText;
+                runForm.submit();
+                return;
+            }}
+            promptInput.value = promptText;
+            resizePrompt();
+            showStreamError(error.message);
+        }});
 }});
 
 window.addEventListener("pageshow", () => {{
     setRunning(false);
-    activityEvents.replaceChildren();
+    hideThinking();
     liveSteps.clear();
     liveTools.clear();
     resizePrompt();
@@ -1043,6 +1135,8 @@ def render_current_page(
 
 
 class AgentRequestHandler(BaseHTTPRequestHandler):
+    disable_nagle_algorithm = True
+
     def do_GET(self) -> None:
         url = urlsplit(self.path)
         if url.path == "/login":
