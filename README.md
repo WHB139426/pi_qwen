@@ -69,6 +69,7 @@ pi_qwen/
 The current implementation supports:
 
 - [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)
+- [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)
 - vLLM as the inference backend
 
 Use the official Hugging Face model identifier for both tokenizer loading and
