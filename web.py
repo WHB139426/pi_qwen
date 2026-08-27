@@ -6,6 +6,7 @@ import hmac
 import html
 import hashlib
 import json
+import mimetypes
 import os
 import re
 import secrets
@@ -16,13 +17,13 @@ from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 from uuid import UUID, uuid4
 
 import bleach
 import markdown
 
-from agent_core import AgentResult, JsonConversationStore, JsonUsageStore, Message, UsageState
+from agent_core import Agent, AgentResult, JsonConversationStore, JsonUsageStore, Message, UsageState
 from main import CONTEXT_WINDOW, create_agent
 
 
@@ -31,11 +32,17 @@ PORT = 8765
 SESSION_COOKIE_NAME = "haibo_agent_session"
 MAX_PROMPT_CHARS = 20_000
 MAX_REQUEST_BYTES = 64 * 1024
+MAX_ARTIFACTS = 200
+FILE_CHUNK_BYTES = 1024 * 1024
 PASSWORD_HASH_ITERATIONS = 600_000
 DEFAULT_REASONING_EFFORT = "max"
 REASONING_EFFORTS = ("low", "high", "max")
 USERS_PATH = Path("./tmp/web_users.json")
 USER_WORKSPACES_ROOT = Path("./tmp/users")
+ARTIFACTS_DIRECTORY_NAME = "artifacts"
+ARTIFACT_DOWNLOADS_DIRECTORY_NAME = "downloads"
+ARTIFACT_OUTPUTS_DIRECTORY_NAME = "outputs"
+ARTIFACT_INSTRUCTION_HEADING = "## Web Artifact Delivery"
 USERNAME_PATTERN = re.compile(r"[a-z0-9_]{3,32}")
 USER_LOCKS: dict[str, Lock] = {}
 USER_LOCKS_GUARD = Lock()
@@ -116,6 +123,73 @@ def conversation_paths(username: str, conversation_id: str) -> tuple[Path, Path,
     )
 
 
+def artifacts_root(username: str, conversation_id: str) -> Path:
+    conversation_path, _, _, _ = conversation_paths(username, conversation_id)
+    return conversation_path.parent / ARTIFACTS_DIRECTORY_NAME
+
+
+def artifact_instruction(username: str, conversation_id: str) -> str:
+    workspace = artifacts_root(username, conversation_id).as_posix()
+    if not workspace.startswith("./"):
+        workspace = f"./{workspace}"
+    downloads = f"{workspace}/{ARTIFACT_DOWNLOADS_DIRECTORY_NAME}"
+    outputs = f"{workspace}/{ARTIFACT_OUTPUTS_DIRECTORY_NAME}"
+    return (
+        f"{ARTIFACT_INSTRUCTION_HEADING}\n\n"
+        f"This conversation's artifact workspace is `{workspace}/`. Every external file "
+        "that you download with curl, wget, Python, an API, or any other command must be "
+        f"saved under `{downloads}/`. Every final file intended for the user must be saved "
+        f"under `{outputs}/`. You may create subdirectories inside either directory. Files "
+        "inside the artifact workspace are shown to the user as downloadable attachments "
+        "in the web UI. Do not place conversation state, caches, or unrelated scratch files "
+        "there, and do not claim that a file was downloaded or delivered until its creation "
+        "has succeeded."
+    )
+
+
+def _with_artifact_instruction(system_prompt: str, instruction: str) -> str:
+    marker = f"\n\n{ARTIFACT_INSTRUCTION_HEADING}"
+    base = system_prompt.split(marker, 1)[0].rstrip()
+    return f"{base}\n\n{instruction}" if base else instruction
+
+
+def configure_agent_artifacts(
+    agent: Agent,
+    username: str,
+    conversation_id: str,
+    conversation_path: Path,
+) -> None:
+    root = artifacts_root(username, conversation_id)
+    root.mkdir(parents=True, exist_ok=True)
+    if root.is_symlink() or not root.is_dir():
+        raise RuntimeError("artifact workspace must be a real directory")
+    for directory_name in (
+        ARTIFACT_DOWNLOADS_DIRECTORY_NAME,
+        ARTIFACT_OUTPUTS_DIRECTORY_NAME,
+    ):
+        directory = root / directory_name
+        directory.mkdir(exist_ok=True)
+        if directory.is_symlink() or not directory.is_dir():
+            raise RuntimeError(f"artifact {directory_name} path must be a real directory")
+    instruction = artifact_instruction(username, conversation_id)
+    agent.system_prompt = _with_artifact_instruction(agent.system_prompt, instruction)
+
+    if not conversation_path.is_file():
+        return
+    store = JsonConversationStore(conversation_path)
+    messages = store.load()
+    for message in messages:
+        if message.get("role") != "system":
+            continue
+        content = message.get("content")
+        current = content if isinstance(content, str) else ""
+        message["content"] = _with_artifact_instruction(current, instruction)
+        store.save(messages)
+        return
+    messages.insert(0, {"role": "system", "content": agent.system_prompt})
+    store.save(messages)
+
+
 def legacy_user_paths(username: str) -> tuple[Path, Path, Path]:
     directory = user_root(username)
     return (
@@ -151,6 +225,62 @@ def load_usage_state(username: str, conversation_id: str) -> UsageState:
     if not store.exists():
         return UsageState()
     return store.load()
+
+
+def resolve_artifact(
+    username: str,
+    conversation_id: str,
+    relative_path: str,
+) -> Path:
+    if not relative_path or "\x00" in relative_path:
+        raise ValueError("invalid artifact path")
+    parts = relative_path.replace("\\", "/").split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("invalid artifact path")
+
+    root = artifacts_root(username, conversation_id)
+    if not root.is_dir() or root.is_symlink():
+        raise FileNotFoundError("artifact directory does not exist")
+    current = root
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            raise PermissionError("symbolic-link artifacts are not downloadable")
+
+    root_resolved = root.resolve(strict=True)
+    candidate = current.resolve(strict=True)
+    if not candidate.is_relative_to(root_resolved) or not candidate.is_file():
+        raise PermissionError("artifact path escapes its conversation workspace")
+    if candidate.stat().st_nlink > 1:
+        raise PermissionError("hard-linked artifacts are not downloadable")
+    return candidate
+
+
+def list_artifacts(username: str, conversation_id: str) -> list[dict[str, object]]:
+    root = artifacts_root(username, conversation_id)
+    if not root.is_dir() or root.is_symlink():
+        return []
+    artifacts = []
+    for path in root.rglob("*"):
+        if len(artifacts) >= MAX_ARTIFACTS:
+            break
+        if not path.is_file():
+            continue
+        relative_path = path.relative_to(root).as_posix()
+        try:
+            safe_path = resolve_artifact(username, conversation_id, relative_path)
+            stat = safe_path.stat()
+        except (OSError, ValueError):
+            continue
+        artifacts.append(
+            {
+                "path": relative_path,
+                "size": stat.st_size,
+                "modified_ns": stat.st_mtime_ns,
+            }
+        )
+    artifacts.sort(key=lambda item: (str(item["path"]).lower(), str(item["path"])))
+    return artifacts
 
 
 def conversation_title(messages: list[Message]) -> str:
@@ -571,6 +701,41 @@ def render_usage(state: UsageState) -> str:
 """
 
 
+def format_file_size(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    raise AssertionError("unreachable")
+
+
+def render_artifacts(username: str, conversation_id: str) -> str:
+    items = []
+    for artifact in list_artifacts(username, conversation_id):
+        relative_path = str(artifact["path"])
+        label = html.escape(relative_path)
+        size = html.escape(format_file_size(int(artifact["size"])))
+        href = f"/chat/{conversation_id}/artifacts/{quote(relative_path, safe='/')}"
+        items.append(
+            '<a class="artifact-item" '
+            f'href="{html.escape(href, quote=True)}" download>'
+            '<span class="artifact-icon" aria-hidden="true">&#128206;</span>'
+            f'<span class="artifact-name">{label}</span>'
+            f'<span class="artifact-size">{size}</span>'
+            '<span class="artifact-download">Download</span>'
+            '</a>'
+        )
+    if not items:
+        return ""
+    return (
+        '<section class="artifacts" aria-label="Conversation attachments">'
+        '<h2>Attachments</h2>'
+        f'<div class="artifact-list">{"".join(items)}</div>'
+        '</section>'
+    )
+
+
 def render_sidebar(
     username: str,
     conversations: list[dict[str, str]],
@@ -635,6 +800,7 @@ def render_page(
     history_html = render_history(messages)
     sidebar_html = render_sidebar(username, conversations, conversation_id)
     usage_html = render_usage(usage_state or UsageState())
+    artifacts_html = render_artifacts(username, conversation_id)
     reasoning_options = render_reasoning_options(reasoning_effort)
     reasoning_label = reasoning_effort.capitalize()
     page_class = "chat-page" if has_visible_messages(messages) else "landing-page"
@@ -740,6 +906,15 @@ button, select {{ color: inherit; }}
 .error pre {{ margin-bottom: 0; white-space: pre-wrap; }}
 .live-tool-status {{ padding: 0.45rem 0.65rem; color: #777; border-top: 1px solid #292929; }}
 .activity-error {{ margin: 0.6rem 0; padding: 0.65rem; border: 1px solid #713939; border-radius: 0.6rem; color: #ffb4b4; background: #2a1717; white-space: pre-wrap; }}
+.artifacts {{ margin: 0 0 1.5rem; padding: 0.85rem; border: 1px solid #303030; border-radius: 0.85rem; background: #171717; }}
+.artifacts h2 {{ margin: 0 0 0.65rem; color: #bdbdbd; font-size: 0.85rem; font-weight: 650; }}
+.artifact-list {{ display: grid; gap: 0.45rem; }}
+.artifact-item {{ display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 0.65rem; padding: 0.65rem 0.7rem; border: 1px solid #303030; border-radius: 0.65rem; color: #d8d8d8; background: #1d1d1d; text-decoration: none; }}
+.artifact-item:hover {{ border-color: #484848; background: #222; }}
+.artifact-icon {{ color: #8eb6f1; }}
+.artifact-name {{ min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+.artifact-size {{ color: #777; font-size: 0.78rem; }}
+.artifact-download {{ color: #9ebce8; font-size: 0.8rem; }}
 @media (max-width: 760px) {{
     .sidebar {{ width: min(86vw, 300px); transform: translateX(-100%); transition: transform 0.2s ease; box-shadow: 18px 0 60px rgba(0, 0, 0, 0.45); }}
     .sidebar.open {{ transform: translateX(0); }}
@@ -763,6 +938,7 @@ button, select {{ color: inherit; }}
 <main class="shell">
 <header class="brand"><h1>Haibo's GLM-5.3-Flash</h1></header>
 <div class="history">{history_html}</div>
+<div id="artifacts-container">{artifacts_html}</div>
 {error_section}
 <form id="run-form" class="composer" method="post" action="/chat/{conversation_id}/run">
 <textarea id="prompt" name="prompt" rows="1" placeholder="Ask anything, or task an agent..." required>{prompt_html}</textarea>
@@ -796,6 +972,7 @@ const sidebarClose = document.getElementById("sidebar-close");
 const sidebarBackdrop = document.getElementById("sidebar-backdrop");
 const deleteForms = document.querySelectorAll(".delete-form");
 const history = document.querySelector(".history");
+const artifactsContainer = document.getElementById("artifacts-container");
 const liveSteps = new Map();
 const liveTools = new Map();
 const pendingModelSteps = new Set();
@@ -944,6 +1121,10 @@ function updateConversationTitle(title) {{
     if (!activeLink) {{ return; }}
     activeLink.textContent = title;
     activeLink.title = title;
+}}
+
+function updateArtifacts(renderedHtml) {{
+    artifactsContainer.innerHTML = renderedHtml || "";
 }}
 
 function streamedReasoning(raw) {{
@@ -1105,6 +1286,7 @@ function handleAgentEvent(event) {{
         if (state) {{ finalizeContent(state, event.answer_html || ""); }}
         updateUsage(event.usage_html || "");
         updateConversationTitle(event.conversation_title || "");
+        updateArtifacts(event.artifacts_html || "");
         hideThinking();
         setRunning(false);
         maybeScroll();
@@ -1231,6 +1413,15 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         username = self._authenticated_user()
         if username is None:
             self._redirect("/login")
+            return
+        artifact_request = self._artifact_from_path(url.path)
+        if artifact_request is not None:
+            conversation_id, relative_path = artifact_request
+            _, _, _, metadata_path = conversation_paths(username, conversation_id)
+            if not metadata_path.is_file():
+                self.send_error(404)
+                return
+            self._send_artifact(username, conversation_id, relative_path)
             return
         if url.path == "/":
             self._redirect_conversation(
@@ -1400,6 +1591,12 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                 reasoning_effort=reasoning_effort,
                 event_callback=event_callback,
             )
+            configure_agent_artifacts(
+                agent,
+                username,
+                conversation_id,
+                conversation_path,
+            )
             result = agent.run(prompt)
             update_conversation_metadata(username, conversation_id, prompt)
             return result
@@ -1455,6 +1652,7 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                     "conversation_title": read_conversation_metadata(
                         username, conversation_id
                     )["title"],
+                    "artifacts_html": render_artifacts(username, conversation_id),
                 }
             )
         except Exception as exc:
@@ -1604,6 +1802,40 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             raise ValueError("request body must be UTF-8") from exc
         return parse_qs(body, keep_blank_values=True)
 
+    def _send_artifact(
+        self,
+        username: str,
+        conversation_id: str,
+        relative_path: str,
+    ) -> None:
+        try:
+            with conversation_lock(username, conversation_id):
+                path = resolve_artifact(username, conversation_id, relative_path)
+                size = path.stat().st_size
+                content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+                ascii_name = re.sub(r"[^A-Za-z0-9._-]", "_", path.name) or "download"
+                encoded_name = quote(path.name, safe="")
+
+                with path.open("rb") as artifact:
+                    self.send_response(200)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(size))
+                    self.send_header(
+                        "Content-Disposition",
+                        f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded_name}",
+                    )
+                    self.send_header("Cache-Control", "private, no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.end_headers()
+                    while chunk := artifact.read(FILE_CHUNK_BYTES):
+                        self.wfile.write(chunk)
+        except FileNotFoundError:
+            self.send_error(404)
+        except (PermissionError, ValueError):
+            self.send_error(403)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
     def _send_html(self, status: int, body: bytes) -> None:
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1632,6 +1864,20 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             return validate_conversation_id(parts[1])
         except ValueError:
             return None
+
+    @staticmethod
+    def _artifact_from_path(path: str) -> tuple[str, str] | None:
+        parts = path.strip("/").split("/", 3)
+        if len(parts) != 4 or parts[0] != "chat" or parts[2] != "artifacts":
+            return None
+        try:
+            conversation_id = validate_conversation_id(parts[1])
+            relative_path = unquote(parts[3], errors="strict")
+        except (UnicodeDecodeError, ValueError):
+            return None
+        if not relative_path:
+            return None
+        return conversation_id, relative_path
 
     def _redirect_home(self, reasoning_effort: str) -> None:
         self._redirect(f"/?reasoning_effort={reasoning_effort}")
