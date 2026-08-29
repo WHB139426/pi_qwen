@@ -9,7 +9,8 @@ from typing import Callable
 from agent_core import Agent, AgentResult, JsonConversationStore, JsonUsageStore
 from backends import VLLMBackend, VLLMOptions
 from protocols import GLMProtocol, QwenProtocol
-from tools import TOOLS
+from tools import TOOLS, make_view_image_tool
+from tools.skill import render_skill_catalog
 
 
 """
@@ -23,7 +24,22 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve /data4/haibo/weights/Qwen3.8-27B \
     --port 8000 \
     --dtype bfloat16 \
     --tensor-parallel-size 4 \
-    --max-model-len 262144 \
+    --max-model-len 1010000 \
+    --hf-overrides '{"text_config": {"max_position_embeddings": 1010000}}' \
+    --allowed-local-media-path /data4/haibo/code/pi_qwen/tmp/users \
+    --limit-mm-per-prompt '{"image": 100, "video": 100}' \
+    --gpu-memory-utilization 0.90
+
+CUDA_VISIBLE_DEVICES=2 vllm serve /data4/haibo/weights/Qwen3.8-27B \
+    --served-model-name qwen3.8-27b \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --dtype bfloat16 \
+    --tensor-parallel-size 1 \
+    --max-model-len 1010000 \
+    --hf-overrides '{"text_config": {"max_position_embeddings": 1010000}}' \
+    --allowed-local-media-path /data4/haibo/code/pi_qwen/tmp/users \
+    --limit-mm-per-prompt '{"image": 100, "video": 100}' \
     --gpu-memory-utilization 0.90
 
 GLM-5.3-Flash:
@@ -35,6 +51,7 @@ sudo docker run --rm \
     --network host \
     -e VLLM_ENGINE_READY_TIMEOUT_S=3600 \
     -v /data4/haibo/weights/GLM-5.3-Flash:/model:ro \
+    -v /data4/haibo/code/pi_qwen/tmp/users:/data4/haibo/code/pi_qwen/tmp/users:ro \
     vllm/vllm-openai:glm53-flash \
     /model \
     --served-model-name glm-5.3-flash \
@@ -43,6 +60,8 @@ sudo docker run --rm \
     --dtype bfloat16 \
     --tensor-parallel-size 4 \
     --max-model-len 1048576 \
+    --allowed-local-media-path /data4/haibo/code/pi_qwen/tmp/users \
+    --limit-mm-per-prompt '{"image": 100, "video": 100}' \
     --max-num-seqs 16 \
     --gpu-memory-utilization 0.95 \
     --no-enable-flashinfer-autotune
@@ -55,7 +74,8 @@ MODEL_CONFIGS = {
     "qwen": {
         "model_path": "/data4/haibo/weights/Qwen3.8-27B",
         "served_model_name": "qwen3.8-27b",
-        "context_window": 256 * 1024,
+        "context_window": 1_010_000,
+        "supports_multimodal": True,
         "vllm_base_url": "http://127.0.0.1:8000/v1",
         "vllm_options": VLLMOptions(
             max_tokens=128 * 1024,
@@ -75,6 +95,7 @@ MODEL_CONFIGS = {
         "model_path": "/data4/haibo/weights/GLM-5.3-Flash",
         "served_model_name": "glm-5.3-flash",
         "context_window": 1024 * 1024,
+        "supports_multimodal": True,
         "vllm_base_url": "http://127.0.0.1:8000/v1",
         "vllm_options": VLLMOptions(
             max_tokens=128 * 1024,
@@ -95,6 +116,7 @@ MODEL_CONFIG = MODEL_CONFIGS[MODEL_FAMILY]
 MODEL_PATH = MODEL_CONFIG["model_path"]
 VLLM_MODEL_NAME = MODEL_CONFIG["served_model_name"]
 CONTEXT_WINDOW = MODEL_CONFIG["context_window"]
+SUPPORTS_MULTIMODAL = MODEL_CONFIG["supports_multimodal"]
 VLLM_BASE_URL = MODEL_CONFIG["vllm_base_url"]
 
 CONVERSATION_PATH = Path("./tmp/conversation.json")
@@ -104,19 +126,35 @@ RESUME_CONVERSATION = False
 PROMPT = "9月初从上海出发，意大利入，法国出。情侣两人，帮我规划意大利，瑞士，法国的十二日行程，节奏不要太赶，喜欢拍照出片，体验当地人文特色，预算总共4w以内，推荐酒店以及特色美食，但是不要吃太奇怪的食物，考虑天气因素，给我一份具体规划路线，最后计划写成一个.md在./tmp目录下. 在写计划的时候，记得标注新闻、报道、信息以及数据这些东西的来源"
 # PROMPT = "解读英伟达最新财报，并由此分析九月份AI相关产业的股价走势，结合历史上的数据，给出你认为比较适合投资的公司，最后计划写成一个.md在 ./tmp目录下。在写计划的时候，记得标注新闻、报道、信息以及数据这些东西的来源"
 AGENTS_PATH = Path(__file__).with_name("AGENTS.md")
+WORKSPACE_PLACEHOLDER = "{{WORKSPACE}}"
+SKILLS_PLACEHOLDER = "{{SKILLS}}"
+DEFAULT_WORKSPACE_PATH = Path("./tmp")
 
 
-def load_agent_instructions() -> str:
-    return AGENTS_PATH.read_text(encoding="utf-8")
+def load_agent_instructions(workspace_path: str | Path = DEFAULT_WORKSPACE_PATH) -> str:
+    workspace = Path(workspace_path).as_posix().rstrip("/") or "."
+    if not Path(workspace_path).is_absolute() and not workspace.startswith("./"):
+        workspace = f"./{workspace}"
+    workspace = f"{workspace}/"
+    template = AGENTS_PATH.read_text(encoding="utf-8")
+    if WORKSPACE_PLACEHOLDER not in template:
+        raise RuntimeError(f"AGENTS.md is missing {WORKSPACE_PLACEHOLDER}")
+    if SKILLS_PLACEHOLDER not in template:
+        raise RuntimeError(f"AGENTS.md is missing {SKILLS_PLACEHOLDER}")
+    return (
+        template.replace(WORKSPACE_PLACEHOLDER, workspace)
+        .replace(SKILLS_PLACEHOLDER, render_skill_catalog())
+    )
 
 
 def create_agent(
     *,
     model_path: str = MODEL_PATH,
-    max_steps: int = 100,
+    max_steps: int = 10000,
     conversation_path: str | Path = CONVERSATION_PATH,
     usage_path: str | Path | None = None,
     trace_path: str | Path = TRACE_PATH,
+    workspace_path: str | Path = DEFAULT_WORKSPACE_PATH,
     reasoning_effort: str | None = None,
     event_callback: Callable[[dict[str, object]], None] | None = None,
 ) -> Agent:
@@ -135,11 +173,12 @@ def create_agent(
         base_url=VLLM_BASE_URL,
         options=MODEL_CONFIG["vllm_options"],
     )
+    tools = [*TOOLS, make_view_image_tool(workspace_path)]
     return Agent(
         model,
-        TOOLS,
+        tools,
         protocol=protocol,
-        system_prompt=load_agent_instructions(),
+        system_prompt=load_agent_instructions(workspace_path),
         max_steps=max_steps,
         conversation_store=JsonConversationStore(conversation_path),
         usage_store=JsonUsageStore(usage_path),
@@ -152,7 +191,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run a local multi-turn agent conversation.")
     parser.add_argument("--prompt", default=None, help="Optional first user message.")
     parser.add_argument("--model", default=MODEL_PATH)
-    parser.add_argument("--max-steps", type=int, default=100)
+    parser.add_argument("--max-steps", type=int, default=10000)
     args = parser.parse_args()
 
     agent = create_agent(

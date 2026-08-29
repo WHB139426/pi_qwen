@@ -11,9 +11,11 @@ from .types import (
     AgentResult,
     ChatProtocol,
     Message,
+    ModelInput,
     TextGenerator,
     TokenUsage,
     Tool,
+    ToolOutput,
     UsageState,
 )
 from .usage import JsonUsageStore
@@ -67,13 +69,21 @@ class Agent:
                 current_context_tokens=previous_usage_state.current_context_tokens,
             )
         )
+        transient_messages: list[Message] = []
 
         for step in range(1, self.max_steps + 1):
             messages = self._load_messages(messages)
-            context = self.protocol.render(messages, schemas)
+            render_messages = [*messages, *transient_messages]
+            transient_messages = []
+            model_input = self.protocol.render(render_messages, schemas)
+            context = (
+                model_input.context
+                if isinstance(model_input, ModelInput)
+                else model_input
+            )
             self._emit({"type": "generation_start", "step": step})
             generation = self.model.generate(
-                context,
+                model_input,
                 on_delta=lambda delta: self._emit(
                     {"type": "model_delta", "step": step, "delta": delta}
                 ),
@@ -116,9 +126,10 @@ class Agent:
 
             for call in tool_calls:
                 self._emit_tool_call(step, call)
-                tool_result = self._execute_tool(call)
+                tool_result, tool_transient_messages = self._execute_tool(call)
                 messages.append(tool_result)
                 self._save_messages(messages)
+                transient_messages.extend(tool_transient_messages)
                 self._emit(
                     {
                         "type": "tool_result",
@@ -202,29 +213,37 @@ class Agent:
             }
         )
 
-    def _execute_tool(self, call: object) -> Message:
+    def _execute_tool(self, call: object) -> tuple[Message, list[Message]]:
         if not isinstance(call, dict):
-            return self._tool_result("", "", error="invalid tool call")
+            return self._tool_result("", "", error="invalid tool call"), []
 
         call_id = str(call.get("id", ""))
         function = call.get("function")
         if not isinstance(function, dict):
-            return self._tool_result(call_id, "", error="tool call has no function")
+            return self._tool_result(call_id, "", error="tool call has no function"), []
 
         name = str(function.get("name", ""))
         arguments = function.get("arguments", {})
         if not isinstance(arguments, dict):
-            return self._tool_result(call_id, name, error="tool arguments must be an object")
+            return self._tool_result(call_id, name, error="tool arguments must be an object"), []
 
         tool = self.tools.get(name)
         if tool is None:
-            return self._tool_result(call_id, name, error=f"unknown tool: {name}")
+            return self._tool_result(call_id, name, error=f"unknown tool: {name}"), []
 
         try:
             value = tool.function(**arguments)
-            return self._tool_result(call_id, name, value=value)
+            if isinstance(value, ToolOutput):
+                return (
+                    self._tool_result(call_id, name, value=value.value),
+                    list(value.transient_messages),
+                )
+            return self._tool_result(call_id, name, value=value), []
         except Exception as exc:
-            return self._tool_result(call_id, name, error=f"{type(exc).__name__}: {exc}")
+            return (
+                self._tool_result(call_id, name, error=f"{type(exc).__name__}: {exc}"),
+                [],
+            )
 
     @staticmethod
     def _tool_result(call_id: str, name: str, *, value: object = None, error: str | None = None) -> Message:

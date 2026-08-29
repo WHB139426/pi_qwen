@@ -6,7 +6,7 @@ import json
 import re
 import uuid
 
-from agent_core.types import Message
+from agent_core.types import Message, ModelInput
 
 
 TOOL_CALL_PATTERN = re.compile(
@@ -39,9 +39,10 @@ class QwenProtocol:
         self,
         messages: list[Message],
         tools: list[dict[str, object]],
-    ) -> str:
+    ) -> str | ModelInput:
+        template_messages = _prepare_template_messages(messages)
         rendered = self.tokenizer.apply_chat_template(
-            messages,
+            template_messages,
             tools=tools,
             tokenize=False,
             add_generation_prompt=True,
@@ -51,6 +52,17 @@ class QwenProtocol:
         )
         if not isinstance(rendered, str):
             raise TypeError("chat template did not return text")
+        if _contains_multimodal_content(messages):
+            return ModelInput(
+                context=rendered,
+                api_messages=_prepare_api_messages(messages),
+                tools=tools,
+                chat_template_kwargs={
+                    "enable_thinking": self.enable_thinking,
+                    "reasoning_effort": self.reasoning_effort,
+                    "preserve_thinking": self.preserve_thinking,
+                },
+            )
         return rendered
 
     def parse(self, text: str) -> Message:
@@ -97,3 +109,85 @@ def _parse_value(value: str) -> object:
         return json.loads(value)
     except json.JSONDecodeError:
         return value
+
+
+def _contains_multimodal_content(messages: list[Message]) -> bool:
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") in {"image", "image_url", "video", "video_url"}:
+                return True
+    return False
+
+
+def _prepare_template_messages(messages: list[Message]) -> list[Message]:
+    """Normalize API-only video_url blocks for Qwen's local Jinja template."""
+    allowed_keys = {
+        "role",
+        "content",
+        "reasoning_content",
+        "tool_calls",
+        "tool_call_id",
+        "name",
+    }
+    prepared: list[Message] = [
+        {key: value for key, value in message.items() if key in allowed_keys}
+        for message in messages
+    ]
+    for message in prepared:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        normalized_parts: list[object] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "video_url":
+                video_url = part.get("video_url")
+                url = video_url.get("url") if isinstance(video_url, dict) else video_url
+                normalized_parts.append({"type": "video", "video": url})
+            else:
+                normalized_parts.append(part)
+        message["content"] = normalized_parts
+    return prepared
+
+
+def _prepare_api_messages(messages: list[Message]) -> list[Message]:
+    """Remove harness metadata and serialize tool arguments for the chat API."""
+    prepared: list[Message] = []
+    allowed_keys = {
+        "role",
+        "content",
+        "reasoning_content",
+        "tool_calls",
+        "tool_call_id",
+        "name",
+    }
+    for message in messages:
+        item: Message = {
+            key: value for key, value in message.items() if key in allowed_keys
+        }
+        tool_calls = item.get("tool_calls")
+        if isinstance(tool_calls, list):
+            normalized_calls: list[object] = []
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    normalized_calls.append(call)
+                    continue
+                normalized_call = dict(call)
+                function = normalized_call.get("function")
+                if isinstance(function, dict):
+                    normalized_function = dict(function)
+                    arguments = normalized_function.get("arguments")
+                    if not isinstance(arguments, str):
+                        normalized_function["arguments"] = json.dumps(
+                            arguments,
+                            ensure_ascii=False,
+                        )
+                    normalized_call["function"] = normalized_function
+                normalized_calls.append(normalized_call)
+            item["tool_calls"] = normalized_calls
+        prepared.append(item)
+    return prepared

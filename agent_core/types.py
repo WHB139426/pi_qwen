@@ -11,10 +11,25 @@ TokenDeltaCallback = Callable[[str], None]
 AgentEventCallback = Callable[[dict[str, object]], None]
 
 
+@dataclass(frozen=True)
+class ModelInput:
+    """A rendered context plus optional OpenAI-compatible multimodal messages."""
+
+    context: str
+    api_messages: list[Message] | None = None
+    tools: list[dict[str, object]] | None = None
+    chat_template_kwargs: dict[str, object] | None = None
+    mm_processor_kwargs: dict[str, object] | None = None
+
+    @property
+    def is_multimodal(self) -> bool:
+        return self.api_messages is not None
+
+
 class TextGenerator(Protocol):
     def generate(
         self,
-        context: str,
+        model_input: str | ModelInput,
         *,
         on_delta: TokenDeltaCallback | None = None,
     ) -> Generation:
@@ -26,7 +41,7 @@ class ChatProtocol(Protocol):
         self,
         messages: list[Message],
         tools: list[dict[str, object]],
-    ) -> str:
+    ) -> str | ModelInput:
         """Render structured messages into the model's text context."""
 
     def parse(self, text: str) -> Message:
@@ -49,6 +64,14 @@ class Tool:
                 "parameters": self.parameters,
             },
         }
+
+
+@dataclass(frozen=True)
+class ToolOutput:
+    """A persistent tool value plus messages visible for one generation only."""
+
+    value: object
+    transient_messages: tuple[Message, ...] = ()
 
 
 @dataclass(frozen=True)

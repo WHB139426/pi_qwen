@@ -8,10 +8,12 @@ from .types import (
     ChatProtocol,
     Generation,
     Message,
+    ModelInput,
     TextGenerator,
     TokenDeltaCallback,
     TokenUsage,
     Tool,
+    ToolOutput,
     UsageState,
 )
 from .usage import JsonUsageStore
@@ -26,9 +28,11 @@ __all__ = [
     "JsonConversationStore",
     "JsonUsageStore",
     "Message",
+    "ModelInput",
     "TextGenerator",
     "TokenDeltaCallback",
     "TokenUsage",
     "Tool",
+    "ToolOutput",
     "UsageState",
 ]
