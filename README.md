@@ -59,7 +59,8 @@ pi_qwen/
 ├── protocols/
 │   ├── __init__.py             # Public protocol exports
 │   ├── qwen.py                 # Qwen rendering, multimodal conversion, and parsing
-│   └── glm.py                  # GLM rendering, multimodal conversion, and parsing
+│   ├── glm.py                  # GLM rendering, multimodal conversion, and parsing
+│   └── deepseek.py             # DeepSeek V4.1 encoding and DSML parsing
 ├── tools/
 │   ├── __init__.py             # Default tool registry
 │   ├── coding.py               # read, bash, edit, and write
@@ -68,7 +69,7 @@ pi_qwen/
 │   └── web_search.py           # DuckDuckGo Web search
 ├── skills/
 │   ├── financial-analysis/     # Finance research workflow
-│   ├── html-slide-deck/        # Self-contained HTML presentation workflow
+│   ├── html-creation/          # General self-contained HTML workflow
 │   ├── ppt-creation/           # Native PowerPoint workflow
 │   └── travel-planning/        # Travel research and itinerary workflow
 ├── requirements.txt            # Harness and Web dependencies
@@ -98,19 +99,22 @@ the same way.
 ## Supported Models
 
 - [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)
+- [Qwen/Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8)
 - [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)
+- [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
 - [vLLM](https://github.com/vllm-project/vllm) as the inference server
 
-Both configured protocols support text, image, and video messages through a
-vLLM OpenAI-compatible server. Select the active family in `main.py`:
+Qwen and GLM support text, image, and video messages. DeepSeek-V4.1-Flash
+supports text and image messages. Select the active model in `main.py`:
 
 ```python
-MODEL_FAMILY = "glm"  # "qwen" or "glm"
+MODEL_FAMILY = "deepseek-v4.1-flash"
 ```
 
 `MODEL_CONFIGS` contains each model's tokenizer path, served model name, context
-window, protocol settings, and sampling options. GLM runs with `max` reasoning
-effort and Qwen with `xhigh` reasoning effort by default.
+window, protocol settings, and sampling options. DeepSeek uses its official
+reference encoder locally, including the V4.1 DSML tool protocol and numeric
+reasoning effort.
 
 ## Tools
 
@@ -135,7 +139,7 @@ HTML, or presentation pages.
 The current skill registry includes:
 
 - `financial-analysis`
-- `html-slide-deck`
+- `html-creation`
 - `ppt-creation`
 - `travel-planning`
 
@@ -225,6 +229,43 @@ sudo docker run --rm \
     --max-num-seqs 16 \
     --gpu-memory-utilization 0.95 \
     --no-enable-flashinfer-autotune
+```
+
+### DeepSeek-V4.1-Flash
+
+DeepSeek-V4.1-Flash requires a vLLM build with the `deepseek_v41` tokenizer
+mode. Replace `/absolute/path/to/pi_qwen` with the repository's absolute path.
+
+```bash
+sudo docker run --rm \
+    --name deepseek-v41-flash-vllm \
+    --gpus '"device=0,1,2,3"' \
+    --privileged \
+    --ipc=host \
+    --network host \
+    --ulimit memlock=-1:-1 \
+    -e VLLM_ENGINE_READY_TIMEOUT_S=3600 \
+    -v /path/to/DeepSeek-V4.1-Flash:/model:ro \
+    -v /absolute/path/to/pi_qwen/tmp/users:/absolute/path/to/pi_qwen/tmp/users:ro \
+    vllm/vllm-openai:nightly \
+    /model \
+    --served-model-name deepseek-v4.1-flash \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --tensor-parallel-size 4 \
+    --tokenizer-mode deepseek_v41 \
+    --engram-config '{"cpu_offload":true}' \
+    --kv-cache-dtype fp8 \
+    --max-model-len 1048576 \
+    --max-num-seqs 16 \
+    --max-num-batched-tokens 8192 \
+    --gpu-memory-utilization 0.95 \
+    --enable-prefix-caching \
+    --enable-prompt-tokens-details \
+    --no-enable-flashinfer-autotune \
+    --mm-encoder-tp-mode data \
+    --allowed-local-media-path /absolute/path/to/pi_qwen/tmp/users \
+    --limit-mm-per-prompt '{"image":100}'
 ```
 
 The API is expected at `http://127.0.0.1:8000/v1`. Stop a foreground server or

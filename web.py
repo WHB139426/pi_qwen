@@ -25,8 +25,14 @@ import markdown
 
 from agent_core import Agent, AgentResult, JsonConversationStore, JsonUsageStore, Message, UsageState
 from main import (
+    MODEL_DEPLOYMENT_HARDWARE,
+    MODEL_DISPLAY_NAME,
+    MODEL_INFO_URL,
+    MODEL_PROVIDER_NAME,
     CONTEXT_WINDOW,
+    SUPPORTED_MEDIA_TYPES,
     SUPPORTS_MULTIMODAL,
+    calculate_usage_cost,
     create_agent,
     load_agent_instructions,
 )
@@ -56,6 +62,7 @@ CONVERSATION_LOCKS: dict[tuple[str, str], Lock] = {}
 CONVERSATION_LOCKS_GUARD = Lock()
 SESSIONS: dict[str, str] = {}
 SESSIONS_LOCK = Lock()
+WEB_BRAND_NAME = MODEL_DISPLAY_NAME
 MARKDOWN_EXTENSIONS = ["fenced_code", "sane_lists", "tables"]
 MARKDOWN_TAGS = set(bleach.sanitizer.ALLOWED_TAGS) | {
     "br",
@@ -252,14 +259,14 @@ def append_upload_notification(
     )
     content: object = notification
     suffix = media_path.suffix.lower()
-    if SUPPORTS_MULTIMODAL and suffix in {
+    if SUPPORTS_MULTIMODAL and "image" in SUPPORTED_MEDIA_TYPES and suffix in {
         ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"
     }:
         content = [
             {"type": "image_url", "image_url": {"url": media_path.as_uri()}},
             {"type": "text", "text": notification},
         ]
-    elif SUPPORTS_MULTIMODAL and suffix in {
+    elif SUPPORTS_MULTIMODAL and "video" in SUPPORTED_MEDIA_TYPES and suffix in {
         ".mp4", ".mov", ".mkv", ".webm", ".avi", ".mpeg", ".mpg", ".m4v"
     }:
         content = [
@@ -753,7 +760,7 @@ def render_auth_page(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title} · Haibo's GLM-5.3-Flash</title>
+<title>{title} · {WEB_BRAND_NAME}</title>
 <style>
 * {{ box-sizing: border-box; }}
 :root {{ color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
@@ -776,7 +783,7 @@ button:hover {{ background: #3d7be3; }}
 <body>
 <main class="auth-card">
 <header class="brand">
-<h1>Haibo's GLM-5.3-Flash</h1>
+<h1>{WEB_BRAND_NAME}</h1>
 <p>{subtitle}</p>
 </header>
 {error_section}
@@ -806,19 +813,30 @@ def render_register_page(*, username: str = "", error: str = "") -> bytes:
 
 def render_usage(state: UsageState) -> str:
     context_usage = state.current_context_tokens / CONTEXT_WINDOW * 100
+    turn_cache_suffix = "" if state.turn.cache_details_available else " (unavailable)"
+    conversation_cache_suffix = (
+        "" if state.conversation.cache_details_available else " (unavailable)"
+    )
+    cost_suffix = (
+        "" if state.conversation.cache_details_available else " (cache data incomplete)"
+    )
+    conversation_cost = calculate_usage_cost(state.conversation)
     return f"""
 <section class="usage">
 <div class="usage-card">
 <h2>Turn Usage</h2>
-<div>Input tokens: {state.turn.input_tokens:,}</div>
+<div>Input tokens (Cached input): {state.turn.input_tokens:,} ({state.turn.cached_input_tokens:,}{turn_cache_suffix})</div>
+<div>Cache hit rate: {state.turn.cache_hit_rate:.2%}{turn_cache_suffix}</div>
 <div>Output tokens: {state.turn.output_tokens:,}</div>
 <div>Total tokens: {state.turn.total_tokens:,}</div>
 </div>
 <div class="usage-card">
 <h2>Conversation Usage</h2>
-<div>Input tokens: {state.conversation.input_tokens:,}</div>
+<div>Input tokens (Cached input): {state.conversation.input_tokens:,} ({state.conversation.cached_input_tokens:,}{conversation_cache_suffix})</div>
+<div>Cache hit rate: {state.conversation.cache_hit_rate:.2%}{conversation_cache_suffix}</div>
 <div>Output tokens: {state.conversation.output_tokens:,}</div>
 <div>Total tokens: {state.conversation.total_tokens:,}</div>
+<div class="usage-cost">Estimated cost: ${conversation_cost:.6f}{cost_suffix}</div>
 </div>
 <div class="usage-card context-usage">
 <h2>Current Context</h2>
@@ -892,7 +910,7 @@ def render_sidebar(
 <div id="sidebar-backdrop" class="sidebar-backdrop" hidden></div>
 <aside id="sidebar" class="sidebar">
 <div class="sidebar-header">
-<div class="sidebar-brand">Haibo's GLM</div>
+<div class="sidebar-brand">{WEB_BRAND_NAME}</div>
 <button id="sidebar-close" class="sidebar-close" type="button" aria-label="Close conversation history">&times;</button>
 </div>
 <form method="post" action="/new">
@@ -939,7 +957,7 @@ def render_page(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Haibo's GLM-5.3-Flash</title>
+<title>{WEB_BRAND_NAME}</title>
 <style>
 * {{ box-sizing: border-box; }}
 :root {{ color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
@@ -1038,6 +1056,7 @@ button, select {{ color: inherit; }}
 .usage {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.75rem; margin: 2rem 0 1rem; color: #aaa; font-size: 0.86rem; }}
 .usage-card {{ padding: 0.85rem; border: 1px solid #303030; border-radius: 0.8rem; background: #181818; }}
 .usage-card h2 {{ margin: 0 0 0.45rem; color: #d7d7d7; font-size: 0.9rem; }}
+.usage-cost {{ margin-top: 0.55rem; padding-top: 0.55rem; border-top: 1px solid #303030; color: #d7d7d7; font-weight: 600; }}
 .context-usage {{ grid-column: 1 / -1; }}
 .site-footer {{ margin-top: 1.5rem; color: #686868; text-align: center; font-size: 0.75rem; line-height: 1.6; }}
 .site-footer a {{ color: #858585; text-decoration: none; }}
@@ -1114,7 +1133,7 @@ button, select {{ color: inherit; }}
 </div>
 <div class="main-content">
 <main class="shell">
-<header class="brand"><h1>Haibo's GLM-5.3-Flash</h1></header>
+<header class="brand"><h1>{WEB_BRAND_NAME}</h1></header>
 <div class="history">{history_html}</div>
 {error_section}
 <form id="run-form" class="composer" method="post" action="/chat/{conversation_id}/run">
@@ -1134,7 +1153,7 @@ button, select {{ color: inherit; }}
 <div id="artifacts-container">{artifacts_html}</div>
 {usage_html}
 <footer class="site-footer">
-Powered by the custom-built <a href="https://github.com/WHB139426/pi_qwen/" target="_blank" rel="noopener noreferrer">pi_qwen</a> agent framework and Z.ai's <a href="https://docs.z.ai/guides/vlm/glm-5.3-flash" target="_blank" rel="noopener noreferrer">GLM-5.3-Flash</a>, locally deployed on 4&times; NVIDIA H200 GPUs.
+Powered by the custom-built <a href="https://github.com/WHB139426/pi_qwen/" target="_blank" rel="noopener noreferrer">pi_qwen</a> agent framework and the <a href="{MODEL_INFO_URL}" target="_blank" rel="noopener noreferrer">{MODEL_DISPLAY_NAME}</a> model by {MODEL_PROVIDER_NAME}, locally deployed on {MODEL_DEPLOYMENT_HARDWARE}.
 </footer>
 </main>
 </div>
@@ -1317,9 +1336,14 @@ function ensureContentEl(state) {{
 }}
 
 function setContent(state, text) {{
-    if (!text || text === state.renderedContent) {{ return; }}
-    state.renderedContent = text;
-    ensureContentEl(state).textContent = text;
+    const nextText = String(text || "");
+    if (nextText === state.renderedContent) {{ return; }}
+    state.renderedContent = nextText;
+    if (!nextText) {{
+        if (state.contentEl) {{ state.contentEl.remove(); state.contentEl = null; }}
+        return;
+    }}
+    ensureContentEl(state).textContent = nextText;
 }}
 
 function finalizeContent(state, renderedHtml) {{
@@ -1615,8 +1639,22 @@ function streamedContent(raw) {{
     const marker = raw.indexOf("</think>");
     if (marker < 0) {{ return ""; }}
     let content = raw.slice(marker + "</think>".length);
-    content = content.replace(/<tool_call\\b[\\s\\S]*?<\\/tool_call>/g, "");
-    content = content.replace(/<tool_call\\b[\\s\\S]*$/, "");
+    const toolMarkers = ["<tool_call", "<｜DSML｜ calls>"];
+    for (const toolMarker of toolMarkers) {{
+        const toolStart = content.indexOf(toolMarker);
+        if (toolStart >= 0) {{
+            content = content.slice(0, toolStart);
+            continue;
+        }}
+        const maxPrefix = Math.min(toolMarker.length - 1, content.length);
+        for (let length = maxPrefix; length > 0; length -= 1) {{
+            const suffix = content.slice(-length);
+            if (toolMarker.startsWith(suffix)) {{
+                content = content.slice(0, -length);
+                break;
+            }}
+        }}
+    }}
     return content.trim();
 }}
 

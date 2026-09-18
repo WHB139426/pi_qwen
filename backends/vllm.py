@@ -8,6 +8,39 @@ from agent_core import Generation, ModelInput, TokenUsage
 from agent_core.types import TokenDeltaCallback
 
 
+def _token_usage_from_response(usage: object) -> TokenUsage:
+    input_tokens = getattr(usage, "prompt_tokens", None)
+    output_tokens = getattr(usage, "completion_tokens", None)
+    if not isinstance(input_tokens, int) or isinstance(input_tokens, bool):
+        raise RuntimeError("vLLM usage did not include a valid prompt token count")
+    if not isinstance(output_tokens, int) or isinstance(output_tokens, bool):
+        raise RuntimeError("vLLM usage did not include a valid completion token count")
+
+    details = getattr(usage, "prompt_tokens_details", None)
+    if isinstance(details, dict):
+        cached_input_tokens = details.get("cached_tokens")
+    else:
+        cached_input_tokens = getattr(details, "cached_tokens", None)
+
+    cache_details_available = cached_input_tokens is not None
+    if cached_input_tokens is None:
+        cached_input_tokens = 0
+    if (
+        not isinstance(cached_input_tokens, int)
+        or isinstance(cached_input_tokens, bool)
+        or cached_input_tokens < 0
+        or cached_input_tokens > input_tokens
+    ):
+        raise RuntimeError("vLLM usage included an invalid cached token count")
+
+    return TokenUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cached_input_tokens=cached_input_tokens,
+        cache_details_available=cache_details_available,
+    )
+
+
 @dataclass(frozen=True)
 class VLLMOptions:
     max_tokens: int = 32 * 1024
@@ -78,10 +111,7 @@ class VLLMBackend:
             raise RuntimeError("vLLM response did not include token usage")
         return Generation(
             text="".join(parts),
-            usage=TokenUsage(
-                input_tokens=usage.prompt_tokens,
-                output_tokens=usage.completion_tokens,
-            ),
+            usage=_token_usage_from_response(usage),
         )
 
     def _generate_multimodal(
@@ -157,8 +187,5 @@ class VLLMBackend:
             raise RuntimeError("vLLM response did not include token usage")
         return Generation(
             text="".join(parts),
-            usage=TokenUsage(
-                input_tokens=usage.prompt_tokens,
-                output_tokens=usage.completion_tokens,
-            ),
+            usage=_token_usage_from_response(usage),
         )

@@ -70,6 +70,14 @@ class JsonUsageStore:
                 value.get("output_tokens"),
                 f"{name}.output_tokens",
             ),
+            cached_input_tokens=cls._parse_optional_non_negative_int(
+                value.get("cached_input_tokens"),
+                f"{name}.cached_input_tokens",
+            ),
+            cache_details_available=cls._parse_optional_bool(
+                value.get("cache_details_available"),
+                f"{name}.cache_details_available",
+            ),
         )
 
     @staticmethod
@@ -78,10 +86,27 @@ class JsonUsageStore:
             raise RuntimeError(f"usage JSON field '{name}' must be a non-negative integer")
         return value
 
+    @classmethod
+    def _parse_optional_non_negative_int(cls, value: object, name: str) -> int:
+        if value is None:
+            return 0
+        return cls._parse_non_negative_int(value, name)
+
+    @staticmethod
+    def _parse_optional_bool(value: object, name: str) -> bool:
+        if value is None:
+            return False
+        if not isinstance(value, bool):
+            raise RuntimeError(f"usage JSON field '{name}' must be a boolean")
+        return value
+
     @staticmethod
     def _usage_dict(usage: TokenUsage) -> dict[str, int]:
         return {
             "input_tokens": usage.input_tokens,
+            "cached_input_tokens": usage.cached_input_tokens,
+            "uncached_input_tokens": usage.uncached_input_tokens,
+            "cache_details_available": usage.cache_details_available,
             "output_tokens": usage.output_tokens,
             "total_tokens": usage.total_tokens,
         }
